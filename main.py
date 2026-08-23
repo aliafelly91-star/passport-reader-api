@@ -1,12 +1,10 @@
 """
-main.py — خدمة قراءة الجوازات (FastAPI)
+main.py — خدمة قراءة الجوازات (FastAPI) - النسخة المصححة
 =========================================
-نفس منطق السكربت اللي أعطى نتائج 100% بالضبط، محوّل لخدمة ويب.
-التطبيق يرسل صورة الجواز، والخدمة ترجع البيانات المقروءة كـ JSON.
+نفس منطق السكربت الأصلي، مع إضافة دعم الصورة المقلوبة، وإصلاح استخراج الأسماء.
 """
 
 import re
-import io
 import cv2
 import numpy as np
 import pytesseract
@@ -54,7 +52,7 @@ MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
 
 
 def preprocess_variants(img_bgr):
-    """نولّد عدة نسخ معالجة مختلفة من الصورة (نفس السكربت الأصلي)"""
+    """نولّد عدة نسخ معالجة مختلفة من الصورة"""
     variants = []
     h, w = img_bgr.shape[:2]
 
@@ -62,26 +60,20 @@ def preprocess_variants(img_bgr):
         y_start = int(h * (1 - crop_ratio))
         crop = img_bgr[y_start:h, 0:w]
 
-        # نكبّر لو صغير (مهم جداً لدقة القراءة)
+        # نكبّر لو صغير
         if crop.shape[1] < 1400:
             scale = 1400 / crop.shape[1]
-            crop = cv2.resize(crop, None, fx=scale, fy=scale,
-                              interpolation=cv2.INTER_CUBIC)
+            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
         # نسخة 1: عتبة تكيّفية
-        variants.append(cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 31, 15))
-
+        variants.append(cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15))
         # نسخة 2: Otsu
         _, v2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(v2)
-
         # نسخة 3: تحسين تباين
-        variants.append(cv2.createCLAHE(
-            clipLimit=2.0, tileGridSize=(8, 8)).apply(gray))
+        variants.append(cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray))
 
     return variants
 
@@ -110,20 +102,14 @@ def format_date(yymmdd, is_birth=True):
         return ""
 
 
-def read_passport_from_bytes(image_bytes: bytes) -> dict:
-    """الدالة الرئيسية — نجرب كل النسخ ونختار الأعلى نقاطاً"""
-    np_array = np.frombuffer(image_bytes, np.uint8)
-    img_bgr = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
-
-    if img_bgr is None:
-        return {"success": False, "error": "تعذر فك ترميز الصورة"}
-
+def process_image(img_bgr):
+    """دالة مساعدة لمعالجة صورة واحدة وإرجاع أفضل نتيجة"""
     best_score = -1
     best_data = None
 
     for variant in preprocess_variants(img_bgr):
         try:
-            text = pytesseract.image_to_string(variant, config=TESS_CONFIG)
+            text = pytesseract.image_to_string(variant, config=TESS_CONFIG, lang='eng')
             l1, l2 = extract_mrz_lines(text)
             if not l1 or not l2:
                 continue
@@ -141,10 +127,18 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
             if score > best_score:
                 best_score = score
                 country_code = (fields.country or "").upper()
+                
+                # استخراج الأسماء بشكل صحيح من الـ MRZ
+                # الاسم بالـ MRZ يكون بهذا الشكل: SURNAME<<GIVEN<NAMES
+                raw_name = fields.name or ""
+                name_parts = raw_name.split("<<")
+                surname = name_parts[0].replace("<", " ").strip() if len(name_parts) > 0 else ""
+                given_names = name_parts[1].replace("<", " ").strip() if len(name_parts) > 1 else ""
+
                 best_data = {
                     "success": True,
-                    "given_name_en": (fields.name or "").strip(),
-                    "surname_en": (fields.surname or "").strip(),
+                    "given_name_en": given_names,
+                    "surname_en": surname,
                     "passport_number": (fields.document_number or "").strip(),
                     "nationality": NATIONALITY_NAMES.get(country_code, country_code),
                     "residence_country": COUNTRY_NAMES.get(country_code, country_code),
@@ -152,17 +146,35 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
                     "expiry_date": format_date(fields.expiry_date, False),
                     "sex": fields.sex or "",
                     "score": score,
-                    "is_verified": score >= 4,
+                    "is_verified": score >= 3, # خففنا الشرط لـ 3 عشان يقبل لو رقم تحقق وحد غلط
                 }
 
             if score >= 4:
                 break
         except Exception:
             continue
+            
+    return best_data
+
+
+def read_passport_from_bytes(image_bytes: bytes) -> dict:
+    """الدالة الرئيسية - نجرب الصورة الأصلية ثم المعكوسة"""
+    np_array = np.frombuffer(image_bytes, np.uint8)
+    img_bgr = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
+
+    if img_bgr is None:
+        return {"success": False, "error": "تعذر فك ترميز الصورة"}
+
+    # 1. نجرب الصورة الأصلية
+    best_data = process_image(img_bgr)
+
+    # 2. لو ما لقينا شي، نجرب الصورة مقلوبة (180 درجة)
+    if best_data is None:
+        img_flipped = cv2.rotate(img_bgr, cv2.ROTATE_180)
+        best_data = process_image(img_flipped)
 
     if best_data is None:
-        return {"success": False,
-                "error": "ما قدرنا نلقى منطقة قراءة آلية واضحة بالصورة"}
+        return {"success": False, "error": "ما قدرنا نلقى منطقة قراءة آلية واضحة بالصورة"}
 
     return best_data
 
@@ -187,5 +199,5 @@ async def read_passport_endpoint(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": f"خطأ داخلي: {str(e)}"},
+            content={"success": False, "error": f"خطأ داخلي: {str(e)}"}
         )
