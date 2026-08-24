@@ -1,15 +1,27 @@
 """
-main.py — خدمة قراءة الجوازات (FastAPI)
-=========================================
-نسخة محسنة للقراءة السحابية.
+main.py — خدمة قراءة الجوازات (FastAPI) — النسخة المصححة
+==========================================================
+شنو تغيّر بهذي النسخة (مقارنة بالقديمة):
+
+1. إصلاح المشكلة الأساسية: الاسم واللقب كانوا يطلعون غلط أو "None"
+   السبب: الكود القديم كان ياخذ fields.name بس ويقسمه على "<<"،
+   بينما مكتبة mrz أصلاً تفصلهم لحقلين (surname + name).
+   الحل: نقرا اللقب والاسم من مواقعهم الصحيحة بالسطر الأول مباشرة.
+
+2. السطر الأول (اللي بيه الأسماء) ما عليه أي رقم تحقق بمعيار TD3 —
+   يعني ممكن يكون خردة والقراءة تظل "مؤكدة"! أضفنا فحص جودة
+   للأسماء ودخّلناه بالتقييم، حتى النتيجة اللي أسماؤها سليمة تفوز.
+
+3. ما نرجّع أبداً كلمة "None" ولا رموز غريبة — كل حقل ينظّف قبل
+   ما يطلع، وإذا مو صالح يرجع فاضي.
+
+4. أضفنا استخراج تاريخ الإصدار واسم الأب/الزوج من النص المطبوع
+   (هذول أصلاً غير موجودين بمنطقة القراءة الآلية).
+
+5. أضفنا /health للإيقاظ السريع، ودعم دوران 90 و270 درجة.
 
 - نفس Endpoint: /read-passport
-- نفس أسماء الحقول التي ينتظرها Flutter
-- لا يوجد أي تغيير مطلوب في تطبيق Flutter
-- يدعم الصورة الأصلية + 180 درجة
-- يجرب عدة طرق لمعالجة صورة الـ MRZ
-- يبحث عن أفضل سطرين MRZ بدل الاعتماد على قراءة واحدة
-- يستخدم MRZ checksum لاختيار النتيجة الأقوى
+- نفس أسماء الحقول اللي ينتظرها Flutter (أضفنا حقول جديدة بس، ما حذفنا شي)
 """
 
 import re
@@ -29,6 +41,7 @@ app = FastAPI(title="خدمة قراءة الجوازات")
 # إعداد Tesseract
 # ============================================================================
 
+# إعدادات قراءة منطقة MRZ — أحرف كبيرة وأرقام والرمز < فقط
 TESS_CONFIGS = [
     (
         "--oem 1 --psm 6 "
@@ -41,6 +54,9 @@ TESS_CONFIGS = [
         "-c load_system_dawg=0 -c load_freq_dawg=0"
     ),
 ]
+
+# إعداد قراءة النص المطبوع العادي (لتاريخ الإصدار واسم الأب)
+TESS_PRINTED_CONFIG = "--oem 1 --psm 6"
 
 
 # ============================================================================
@@ -124,19 +140,14 @@ NATIONALITY_NAMES = {
 
 
 MONTHS = [
-    "JAN",
-    "FEB",
-    "MAR",
-    "APR",
-    "MAY",
-    "JUN",
-    "JUL",
-    "AUG",
-    "SEP",
-    "OCT",
-    "NOV",
-    "DEC",
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+    "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
 ]
+
+MONTH_INDEX = {name: i + 1 for i, name in enumerate(MONTHS)}
+
+# قيم خردة ممكن ترجع من المكتبة أو من OCR — نرفضها دائماً
+BAD_VALUES = {"NONE", "NULL", "NAN", "N/A", "NA", "-", "--"}
 
 
 # ============================================================================
@@ -144,29 +155,146 @@ MONTHS = [
 # ============================================================================
 
 def clean_ocr_line(line: str) -> str:
-    """
-    ننظف السطر ونبقي فقط أحرف MRZ.
-    """
+    """ننظف السطر ونبقي فقط أحرف MRZ المسموحة."""
 
-    line = line.upper().strip()
+    line = (line or "").upper().strip()
 
-    # أخطاء OCR الشائعة
+    # تصحيح رموز يخلط بيها Tesseract مع الرمز <
     replacements = {
-        "«": "<",
-        "‹": "<",
-        "≤": "<",
-        "—": "<",
-        "_": "<",
-        "|": "<",
-        " ": "",
+        "«": "<", "‹": "<", "≤": "<", "—": "<",
+        "_": "<", "|": "<", "«": "<", " ": "",
     }
 
     for old, new in replacements.items():
         line = line.replace(old, new)
 
-    line = re.sub(r"[^A-Z0-9<]", "", line)
+    return re.sub(r"[^A-Z0-9<]", "", line)
 
-    return line
+
+def safe_text(value) -> str:
+    """
+    نحوّل أي قيمة لنص نظيف.
+
+    الهدف: ما نرجّع أبداً كلمة "None" أو قيم خردة للتطبيق —
+    هذي كانت تظهر بحقل اللقب بالشاشة.
+    """
+
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+
+    if not text:
+        return ""
+
+    if text.upper() in BAD_VALUES:
+        return ""
+
+    return text
+
+
+# ============================================================================
+# قراءة الأسماء من السطر الأول (الإصلاح الأهم)
+# ============================================================================
+
+def clean_name_part(raw: str) -> str:
+    """
+    ننظف اسم مستخرج من MRZ:
+    - نحوّل < لمسافة
+    - نشيل أي رقم أو رمز غريب
+    - نلغي المسافات المتكررة
+    """
+
+    if not raw:
+        return ""
+
+    text = str(raw).upper()
+    text = text.replace("<", " ")
+    text = re.sub(r"[^A-Z ]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if text in BAD_VALUES:
+        return ""
+
+    return text
+
+
+def is_valid_name(name: str) -> bool:
+    """
+    فحص جودة الاسم.
+
+    الاسم الحقيقي: حرفين على الأقل، كله أحرف ومسافات،
+    وما يحتوي سلاسل غريبة مثل حرف واحد مكرر.
+    """
+
+    if not name or len(name) < 2:
+        return False
+
+    if not re.fullmatch(r"[A-Z ]{2,39}", name):
+        return False
+
+    # اسم كله نفس الحرف (مثل "XXXX") = خردة
+    letters = name.replace(" ", "")
+    if len(set(letters)) <= 1:
+        return False
+
+    return True
+
+
+def parse_names_from_line1(l1: str):
+    """
+    نقرا اللقب والاسم الأول من مواقعهم الصحيحة بالسطر الأول.
+
+    معيار TD3 للسطر الأول (44 حرف):
+      الموقع 0-1   : نوع الوثيقة (P<)
+      الموقع 2-4   : رمز الدولة المُصدِرة
+      الموقع 5-43  : SURNAME<<GIVEN<NAMES
+
+    هذا أدق بكثير من الاعتماد على fields.name وحده،
+    لأن المكتبة أصلاً تفصل الحقلين وما ينفع نقسم واحد منهم.
+    """
+
+    if not l1 or len(l1) < 6:
+        return "", ""
+
+    body = l1[5:44]
+
+    # نقص أي حشو << بالنهاية
+    body = body.rstrip("<")
+
+    parts = body.split("<<", 1)
+
+    surname = clean_name_part(parts[0]) if len(parts) >= 1 else ""
+    given_names = clean_name_part(parts[1]) if len(parts) >= 2 else ""
+
+    return surname, given_names
+
+
+def extract_names(fields, l1: str):
+    """
+    نجيب الاسم واللقب بثلاث محاولات مرتبة:
+    1. من السطر الأول مباشرة (الأدق)
+    2. من حقول المكتبة surname / name
+    3. فاضي إذا كلهم فشلوا
+    """
+
+    surname, given_names = parse_names_from_line1(l1)
+
+    # احتياطي من حقول المكتبة
+    if not is_valid_name(surname):
+        surname = clean_name_part(safe_text(getattr(fields, "surname", "")))
+
+    if not is_valid_name(given_names):
+        given_names = clean_name_part(safe_text(getattr(fields, "name", "")))
+
+    # ما نرجّع اسم مو صالح إطلاقاً
+    if not is_valid_name(surname):
+        surname = ""
+
+    if not is_valid_name(given_names):
+        given_names = ""
+
+    return surname, given_names
 
 
 # ============================================================================
@@ -174,20 +302,12 @@ def clean_ocr_line(line: str) -> str:
 # ============================================================================
 
 def extract_mrz_candidates(text: str):
-    """
-    نستخرج جميع الأسطر المحتملة لمنطقة MRZ.
-
-    ما نعتمد فقط على أن السطر يبدأ P،
-    لأن Tesseract أحياناً يخطئ أول حرف.
-    """
-
-    raw_lines = text.splitlines()
+    """نستخرج كل الأسطر المحتملة لمنطقة القراءة الآلية."""
 
     lines = []
 
-    for raw in raw_lines:
+    for raw in (text or "").splitlines():
         cleaned = clean_ocr_line(raw)
-
         if len(cleaned) >= 30:
             lines.append(cleaned)
 
@@ -198,22 +318,18 @@ def extract_mrz_candidates(text: str):
         l1 = lines[i]
         l2 = lines[i + 1]
 
-        # نحاول فقط الأسطر القريبة من طول TD3
         if len(l1) < 30 or len(l2) < 30:
             continue
 
-        # نأخذ أول 44 حرف
         l1_44 = l1[:44].ljust(44, "<")
         l2_44 = l2[:44].ljust(44, "<")
 
-        # السطر الأول لجواز TD3 غالباً يبدأ P
         first_ok = (
             l1_44.startswith("P")
             or l1_44.startswith("<<P")
             or "P<" in l1_44[:5]
         )
 
-        # السطر الثاني عادة يحتوي تواريخ وأرقام تحقق
         second_has_digits = sum(c.isdigit() for c in l2_44) >= 8
 
         if first_ok and second_has_digits:
@@ -222,34 +338,28 @@ def extract_mrz_candidates(text: str):
     return candidates
 
 
-# ============================================================================
-# استخراج إضافي إذا Tesseract دمج الأسطر
-# ============================================================================
-
 def extract_mrz_from_full_text(text: str):
-    """
-    محاولة ثانية لاستخراج MRZ حتى لو Tesseract دمج الأسطر.
-    """
+    """محاولة ثانية لو Tesseract دمج الأسطر كلها بسلسلة وحدة."""
 
     cleaned = clean_ocr_line(text)
 
     candidates = []
 
-    # نبحث عن أي مقطع بطول 88 تقريباً
     for start in range(max(0, len(cleaned) - 100)):
+
         chunk = cleaned[start:start + 88]
 
-        if len(chunk) < 80:
+        if len(chunk) < 88:
             continue
 
         l1 = chunk[:44]
         l2 = chunk[44:88]
 
-        if (
-            len(l1) == 44
-            and len(l2) == 44
-            and sum(c.isdigit() for c in l2) >= 8
-        ):
+        # شرط إضافي: السطر الأول لازم يبدأ بـ P (يقلل الخردة كثير)
+        if not l1.startswith("P"):
+            continue
+
+        if sum(c.isdigit() for c in l2) >= 8:
             candidates.append((l1, l2))
 
     return candidates
@@ -260,11 +370,7 @@ def extract_mrz_from_full_text(text: str):
 # ============================================================================
 
 def format_date(yymmdd, is_birth=True):
-    """
-    نحول تاريخ MRZ إلى:
-
-    YYYY-MON-DD
-    """
+    """نحوّل تاريخ MRZ (YYMMDD) لصيغة YYYY-MON-DD."""
 
     if not yymmdd:
         return ""
@@ -285,10 +391,7 @@ def format_date(yymmdd, is_birth=True):
         if not 1 <= dd <= 31:
             return ""
 
-        if is_birth:
-            year = 1900 + yy if yy > 30 else 2000 + yy
-        else:
-            year = 2000 + yy
+        year = (1900 + yy if yy > 30 else 2000 + yy) if is_birth else 2000 + yy
 
         return f"{year}-{MONTHS[mm - 1]}-{dd:02d}"
 
@@ -297,87 +400,226 @@ def format_date(yymmdd, is_birth=True):
 
 
 # ============================================================================
-# استخراج الأسماء
+# استخراج تاريخ الإصدار واسم الأب من النص المطبوع
+# ============================================================================
+# هذول الحقلين ما موجودين بمنطقة القراءة الآلية إطلاقاً — لازم
+# نقراهم من النص المطبوع بوجه الجواز.
 # ============================================================================
 
-def extract_names(fields):
+FATHER_LABELS = [
+    r"FATHER[' ]?S?\s*NAME",
+    r"HUSBAND[' ]?S?\s*NAME",
+    r"NAME\s*OF\s*FATHER",
+    r"GUARDIAN[' ]?S?\s*NAME",
+    r"\bS\s*/\s*O\b",
+    r"\bW\s*/\s*O\b",
+    r"\bD\s*/\s*O\b",
+]
+
+
+def read_printed_text(img_bgr) -> str:
+    """نقرا النص المطبوع العادي من الجزء العلوي من الصورة."""
+
+    try:
+        h, w = img_bgr.shape[:2]
+
+        # الجزء العلوي 78% — منطقة البيانات المطبوعة
+        top = img_bgr[0:int(h * 0.78), 0:w]
+
+        if top.size == 0:
+            return ""
+
+        if top.shape[1] < 1600:
+            scale = 1600 / top.shape[1]
+            top = cv2.resize(
+                top, None, fx=scale, fy=scale,
+                interpolation=cv2.INTER_CUBIC
+            )
+
+        gray = cv2.cvtColor(top, cv2.COLOR_BGR2GRAY)
+
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        return pytesseract.image_to_string(
+            enhanced,
+            config=TESS_PRINTED_CONFIG,
+            lang="eng",
+        ) or ""
+
+    except Exception:
+        return ""
+
+
+def find_printed_dates(printed_text: str):
     """
-    MRZ:
+    نلقى كل التواريخ المطبوعة بصيغة "14 SEP 2023".
 
-    SURNAME<<GIVEN<NAMES
-
-    نرجع:
-    surname
-    given_names
+    نرجعها كقائمة (سنة, شهر, يوم) مرتبة.
     """
 
-    raw_name = str(fields.name or "").strip()
+    found = []
 
-    if not raw_name:
-        return "", ""
+    pattern = re.compile(
+        r"\b(\d{1,2})\s*[-/ ]?\s*([A-Z]{3})\s*[-/ ]?\s*(\d{4})\b"
+    )
 
-    raw_name = raw_name.replace(" ", "<")
+    for match in pattern.finditer((printed_text or "").upper()):
 
-    parts = raw_name.split("<<", 1)
+        day = int(match.group(1))
+        mon = match.group(2)
+        year = int(match.group(3))
 
-    surname = ""
-    given_names = ""
+        if mon not in MONTH_INDEX:
+            continue
 
-    if len(parts) >= 1:
-        surname = parts[0].replace("<", " ").strip()
+        if not 1 <= day <= 31:
+            continue
 
-    if len(parts) >= 2:
-        given_names = parts[1].replace("<", " ").strip()
+        if not 1900 <= year <= 2100:
+            continue
 
-    # تنظيف المسافات المتكررة
-    surname = re.sub(r"\s+", " ", surname)
-    given_names = re.sub(r"\s+", " ", given_names)
+        found.append((year, MONTH_INDEX[mon], day))
 
-    return surname, given_names
+    return found
+
+
+def extract_issue_date(printed_text: str, birth_date: str, expiry_date: str) -> str:
+    """
+    نستنتج تاريخ الإصدار بذكاء:
+
+    منطقة القراءة الآلية تعطينا الميلاد والنفاذ بشكل مؤكد.
+    التاريخ الثالث المطبوع بالجواز = تاريخ الإصدار.
+
+    كمان الإصدار دائماً قبل النفاذ وبعد الميلاد — نستخدم هذا للفحص.
+    """
+
+    dates = find_printed_dates(printed_text)
+
+    if not dates:
+        return ""
+
+    # نحوّل تواريخ MRZ المعروفة لنفس الشكل حتى نستبعدها
+    known = set()
+
+    for known_date in (birth_date, expiry_date):
+        if not known_date:
+            continue
+        parts = known_date.split("-")
+        if len(parts) == 3 and parts[1] in MONTH_INDEX:
+            try:
+                known.add((int(parts[0]), MONTH_INDEX[parts[1]], int(parts[2])))
+            except Exception:
+                pass
+
+    # حد أعلى وأدنى منطقي
+    expiry_tuple = None
+    if expiry_date:
+        parts = expiry_date.split("-")
+        if len(parts) == 3 and parts[1] in MONTH_INDEX:
+            try:
+                expiry_tuple = (int(parts[0]), MONTH_INDEX[parts[1]], int(parts[2]))
+            except Exception:
+                pass
+
+    candidates = []
+
+    for date_tuple in dates:
+
+        if date_tuple in known:
+            continue
+
+        # الإصدار لازم يكون قبل النفاذ
+        if expiry_tuple and date_tuple >= expiry_tuple:
+            continue
+
+        # الإصدار ما يكون قبل 1980
+        if date_tuple[0] < 1980:
+            continue
+
+        candidates.append(date_tuple)
+
+    if not candidates:
+        return ""
+
+    # نختار الأقرب للنفاذ (لأن الإصدار عادة قبل النفاذ بـ5-10 سنين)
+    best = max(candidates)
+
+    return f"{best[0]}-{MONTHS[best[1] - 1]}-{best[2]:02d}"
+
+
+def extract_father_name(printed_text: str) -> str:
+    """نلقى اسم الأب أو الزوج حسب التسميات المختلفة بالجوازات."""
+
+    text = (printed_text or "").upper()
+
+    for label in FATHER_LABELS:
+
+        match = re.search(label + r"\s*[:\-]?\s*([A-Z][A-Z,'\.\- ]{2,60})", text)
+
+        if not match:
+            continue
+
+        raw = match.group(1)
+
+        # نقطع عند أول سطر جديد أو تسمية ثانية
+        raw = re.split(
+            r"\b(DATE|PLACE|SEX|NATIONALITY|ISSUING|TRACKING|BOOKLET|PASSPORT|AUTHORITY|CITIZENSHIP)\b",
+            raw,
+        )[0]
+
+        name = clean_name_part(raw.replace(",", " "))
+
+        if is_valid_name(name):
+            return name
+
+    return ""
 
 
 # ============================================================================
 # حساب قوة النتيجة
 # ============================================================================
 
-def calculate_score(checker, fields, l1, l2):
+def calculate_score(is_checksum_ok, fields, l1, l2, surname, given_names):
     """
-    نعطي نقاط للنتيجة حسب صحة البيانات.
+    نعطي نقاط للنتيجة حتى نختار الأقوى بين كل الاحتمالات.
 
-    الهدف:
-    إذا OCR أعطى أكثر من نتيجة، نختار الأقوى.
+    ملاحظة مهمة جداً:
+    معيار TD3 ما بيه أي رقم تحقق للسطر الأول (سطر الأسماء)!
+    يعني القراءة تقدر تكون "مؤكدة" رياضياً والأسماء خردة كاملة.
+    عشان هيك نعطي وزن كبير لجودة الأسماء بالتقييم.
     """
 
     score = 0
 
-    # checksum
-    try:
-        if checker.report.warnings == []:
-            score += 5
-    except Exception:
-        pass
+    if is_checksum_ok:
+        score += 6
 
-    # رقم الجواز
-    if fields.document_number:
+    # جودة الأسماء — الوزن الأكبر بعد أرقام التحقق
+    if is_valid_name(surname):
+        score += 3
+
+    if is_valid_name(given_names):
+        score += 3
+
+    # السطر الأول لازم يبدأ P ويليه رمز دولة من 3 أحرف
+    if l1.startswith("P") and re.fullmatch(r"[A-Z]{3}", l1[2:5] or ""):
         score += 2
 
-    # تاريخ الميلاد
-    if fields.birth_date:
+    doc_number = safe_text(getattr(fields, "document_number", "")).replace("<", "")
+    if len(doc_number) >= 6:
         score += 2
 
-    # تاريخ الانتهاء
-    if fields.expiry_date:
+    if getattr(fields, "birth_date", None):
         score += 2
 
-    # الجنسية
-    if fields.country:
+    if getattr(fields, "expiry_date", None):
+        score += 2
+
+    country_code = safe_text(getattr(fields, "country", "")).upper()
+    if country_code in COUNTRY_NAMES:
         score += 1
 
-    # الاسم
-    if fields.name:
-        score += 1
-
-    # طول MRZ الصحيح
     if len(l1) == 44:
         score += 1
 
@@ -392,71 +634,86 @@ def calculate_score(checker, fields, l1, l2):
 # ============================================================================
 
 def try_mrz_candidate(l1, l2):
+    """نجرب زوج أسطر ونرجع (النقاط، البيانات)."""
+
     try:
 
-        # إصلاح بسيط لبعض أخطاء OCR
         l1 = clean_ocr_line(l1)[:44].ljust(44, "<")
         l2 = clean_ocr_line(l2)[:44].ljust(44, "<")
 
-        checker = TD3CodeChecker(
-            f"{l1}\n{l2}",
-            check_expiry=False
-        )
+        checker = TD3CodeChecker(f"{l1}\n{l2}", check_expiry=False)
 
         fields = checker.fields()
 
+        # هل كل أرقام التحقق الرياضية نجحت؟
+        try:
+            is_checksum_ok = (checker.report.warnings == [])
+        except Exception:
+            is_checksum_ok = False
+
+        surname, given_names = extract_names(fields, l1)
+
         score = calculate_score(
-            checker,
-            fields,
-            l1,
-            l2
+            is_checksum_ok, fields, l1, l2, surname, given_names
         )
 
-        country_code = (
-            fields.country or ""
-        ).upper().strip()
+        country_code = safe_text(getattr(fields, "country", "")).upper()
 
-        surname, given_names = extract_names(fields)
+        nationality_code = safe_text(
+            getattr(fields, "nationality", "")
+        ).upper() or country_code
+
+        passport_number = safe_text(
+            getattr(fields, "document_number", "")
+        ).replace("<", "").upper()
+
+        birth = format_date(getattr(fields, "birth_date", ""), True)
+        expiry = format_date(getattr(fields, "expiry_date", ""), False)
+
+        sex = safe_text(getattr(fields, "sex", "")).upper()
+        if sex not in ("M", "F"):
+            sex = ""
 
         result = {
             "success": True,
 
             "given_name_en": given_names,
-
             "surname_en": surname,
 
-            "passport_number": (
-                fields.document_number or ""
-            ).strip(),
+            # حقول جديدة — تنعبّي من النص المطبوع لاحقاً
+            "father_name_en": "",
+            "issue_date": "",
+
+            "passport_number": passport_number,
 
             "nationality": NATIONALITY_NAMES.get(
-                country_code,
-                country_code
+                nationality_code, nationality_code
             ),
 
             "residence_country": COUNTRY_NAMES.get(
-                country_code,
-                country_code
+                country_code, country_code
             ),
 
-            "birth_date": format_date(
-                fields.birth_date,
-                True
-            ),
+            "birth_date": birth,
+            "expiry_date": expiry,
 
-            "expiry_date": format_date(
-                fields.expiry_date,
-                False
-            ),
-
-            "sex": fields.sex or "",
+            "sex": sex,
 
             "score": score,
 
-            # تأكيد القراءة فقط إذا checksum صحيح
-            "is_verified": (
-                checker.report.warnings == []
+            # مؤكد = أرقام التحقق نجحت
+            "is_verified": is_checksum_ok,
+
+            # مؤكد بالكامل = أرقام التحقق نجحت **والأسماء سليمة**
+            "is_fully_verified": (
+                is_checksum_ok
+                and is_valid_name(surname)
+                and is_valid_name(given_names)
             ),
+
+            # للتشخيص لو صارت مشكلة بالمستقبل
+            "mrz_line1": l1,
+            "mrz_line2": l2,
         }
 
         return score, result
@@ -466,219 +723,122 @@ def try_mrz_candidate(l1, l2):
 
 
 # ============================================================================
-# معالجة صورة واحدة
+# توليد نسخ معالَجة من الصورة
 # ============================================================================
 
 def preprocess_variants(img_bgr):
-    """
-    نولد نسخ متعددة من الصورة.
-
-    نستخدم:
-    - القص السفلي
-    - grayscale
-    - CLAHE
-    - OTSU
-    - adaptive threshold
-    - resize
-    """
+    """نولّد نسخ متعددة من الصورة بمعالجات مختلفة."""
 
     variants = []
 
     h, w = img_bgr.shape[:2]
 
-    # ------------------------------------------------------------------------
-    # النسخة الكاملة أيضاً
-    # ------------------------------------------------------------------------
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    # ------------------------------------------------------------------
+    # الصورة كاملة
+    # ------------------------------------------------------------------
 
     full = img_bgr.copy()
 
     if full.shape[1] < 1600:
         scale = 1600 / full.shape[1]
-
         full = cv2.resize(
-            full,
-            None,
-            fx=scale,
-            fy=scale,
+            full, None, fx=scale, fy=scale,
             interpolation=cv2.INTER_CUBIC
         )
 
-    gray_full = cv2.cvtColor(
-        full,
-        cv2.COLOR_BGR2GRAY
-    )
+    gray_full = cv2.cvtColor(full, cv2.COLOR_BGR2GRAY)
 
     variants.append(gray_full)
+    variants.append(clahe.apply(gray_full))
 
-    # CLAHE
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
-    )
-
-    variants.append(
-        clahe.apply(gray_full)
-    )
-
-    # OTSU
     _, otsu_full = cv2.threshold(
-        gray_full,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        gray_full, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
-
     variants.append(otsu_full)
 
-    # Adaptive
-    adaptive_full = cv2.adaptiveThreshold(
-        gray_full,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        15
-    )
+    variants.append(cv2.adaptiveThreshold(
+        gray_full, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 15
+    ))
 
-    variants.append(adaptive_full)
+    # ------------------------------------------------------------------
+    # قص المنطقة السفلية بنسب مختلفة
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------------
-    # قص المنطقة السفلية بعدة نسب
-    # ------------------------------------------------------------------------
+    for crop_ratio in [0.25, 0.30, 0.35, 0.40, 0.45, 0.50]:
 
-    for crop_ratio in [
-        0.25,
-        0.30,
-        0.35,
-        0.40,
-        0.45,
-        0.50,
-    ]:
+        y_start = int(h * (1 - crop_ratio))
 
-        y_start = int(
-            h * (1 - crop_ratio)
-        )
-
-        crop = img_bgr[
-            y_start:h,
-            0:w
-        ]
+        crop = img_bgr[y_start:h, 0:w]
 
         if crop.size == 0:
             continue
 
-        # تكبير
         if crop.shape[1] < 1600:
-
             scale = 1600 / crop.shape[1]
-
             crop = cv2.resize(
-                crop,
-                None,
-                fx=scale,
-                fy=scale,
+                crop, None, fx=scale, fy=scale,
                 interpolation=cv2.INTER_CUBIC
             )
 
-        gray = cv2.cvtColor(
-            crop,
-            cv2.COLOR_BGR2GRAY
-        )
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-        # grayscale
         variants.append(gray)
+        variants.append(clahe.apply(gray))
 
-        # CLAHE
-        variants.append(
-            clahe.apply(gray)
-        )
-
-        # OTSU
         _, otsu = cv2.threshold(
-            gray,
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
         )
-
         variants.append(otsu)
 
-        # Adaptive
-        adaptive = cv2.adaptiveThreshold(
-            gray,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            15
-        )
-
-        variants.append(adaptive)
+        variants.append(cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 31, 15
+        ))
 
     return variants
 
 
 # ============================================================================
-# معالجة الصورة واختيار أفضل نتيجة
+# معالجة صورة بزاوية وحدة واختيار أفضل نتيجة
 # ============================================================================
 
 def process_image(img_bgr):
+    """نجرب كل النسخ وكل الإعدادات ونرجع أفضل نتيجة."""
 
     best_score = -1
     best_data = None
 
-    variants = preprocess_variants(img_bgr)
-
-    for variant in variants:
+    for variant in preprocess_variants(img_bgr):
 
         for config in TESS_CONFIGS:
 
             try:
 
                 text = pytesseract.image_to_string(
-                    variant,
-                    config=config,
-                    lang="eng"
+                    variant, config=config, lang="eng"
                 )
-
-                # ------------------------------------------------------------
-                # الطريقة الأولى
-                # ------------------------------------------------------------
 
                 candidates = extract_mrz_candidates(text)
-
-                # ------------------------------------------------------------
-                # الطريقة الثانية
-                # ------------------------------------------------------------
-
-                candidates.extend(
-                    extract_mrz_from_full_text(text)
-                )
-
-                # ------------------------------------------------------------
-                # تجربة كل المرشحين
-                # ------------------------------------------------------------
+                candidates.extend(extract_mrz_from_full_text(text))
 
                 for l1, l2 in candidates:
 
-                    score, data = try_mrz_candidate(
-                        l1,
-                        l2
-                    )
+                    score, data = try_mrz_candidate(l1, l2)
 
                     if data is None:
                         continue
 
                     if score > best_score:
-
                         best_score = score
                         best_data = data
 
-                    # إذا حصلنا على checksum صحيح
-                    # مع بيانات أساسية كاملة، ما نحتاج
-                    # نضيع وقت على باقي النسخ.
+                    # ما نتوقف إلا لما تكون القراءة مؤكدة **والأسماء
+                    # سليمة كمان** — هذا الفرق الجوهري عن النسخة القديمة
                     if (
-                        data["is_verified"]
+                        data["is_fully_verified"]
                         and data["passport_number"]
                         and data["birth_date"]
                         and data["expiry_date"]
@@ -697,87 +857,98 @@ def process_image(img_bgr):
 
 def read_passport_from_bytes(image_bytes: bytes) -> dict:
 
-    np_array = np.frombuffer(
-        image_bytes,
-        np.uint8
-    )
+    np_array = np.frombuffer(image_bytes, np.uint8)
 
-    img_bgr = cv2.imdecode(
-        np_array,
-        cv2.IMREAD_COLOR
-    )
+    img_bgr = cv2.imdecode(np_array, cv2.IMREAD_COLOR)
 
     if img_bgr is None:
+        return {"success": False, "error": "تعذر فك ترميز الصورة"}
 
-        return {
-            "success": False,
-            "error": "تعذر فك ترميز الصورة"
-        }
+    best_data = None
+    best_image = img_bgr
 
-    # ========================================================================
-    # 1. الصورة الأصلية
-    # ========================================================================
+    # نجرب الزوايا بالترتيب — نوقف أول ما نلقى قراءة كاملة
+    rotations = [
+        ("الأصلية", img_bgr),
+        ("180°", cv2.rotate(img_bgr, cv2.ROTATE_180)),
+        ("90°", cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)),
+        ("270°", cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)),
+    ]
 
-    best_data = process_image(
-        img_bgr
-    )
+    for label, rotated in rotations:
 
-    if best_data is not None:
+        data = process_image(rotated)
 
-        # إذا القراءة موثوقة نرجعها مباشرة
-        if best_data.get("is_verified"):
+        if data is None:
+            continue
 
-            return best_data
+        if best_data is None or data.get("score", 0) > best_data.get("score", 0):
+            best_data = data
+            best_image = rotated
 
-    # ========================================================================
-    # 2. الصورة مقلوبة 180 درجة
-    # ========================================================================
-
-    img_flipped = cv2.rotate(
-        img_bgr,
-        cv2.ROTATE_180
-    )
-
-    flipped_data = process_image(
-        img_flipped
-    )
-
-    # إذا المقلوبة أفضل
-    if flipped_data is not None:
-
-        if (
-            best_data is None
-            or flipped_data.get("score", 0)
-            > best_data.get("score", 0)
-        ):
-            best_data = flipped_data
-
-    # ========================================================================
-    # لا توجد نتيجة
-    # ========================================================================
+        # قراءة كاملة (أرقام تحقق + أسماء سليمة) = نوقف فوراً
+        if data.get("is_fully_verified"):
+            best_data = data
+            best_image = rotated
+            break
 
     if best_data is None:
-
         return {
             "success": False,
-            "error": (
-                "ما قدرنا نلقى منطقة قراءة آلية واضحة بالصورة"
-            )
+            "error": "ما قدرنا نلقى منطقة قراءة آلية واضحة بالصورة",
         }
+
+    # ------------------------------------------------------------------
+    # النص المطبوع: تاريخ الإصدار واسم الأب/الزوج
+    # ------------------------------------------------------------------
+
+    try:
+        printed_text = read_printed_text(best_image)
+
+        if printed_text:
+
+            issue = extract_issue_date(
+                printed_text,
+                best_data.get("birth_date", ""),
+                best_data.get("expiry_date", ""),
+            )
+
+            if issue:
+                best_data["issue_date"] = issue
+
+            father = extract_father_name(printed_text)
+
+            if father:
+                best_data["father_name_en"] = father
+
+    except Exception:
+        # فشل قراءة النص المطبوع ما يخرب النتيجة الأساسية
+        pass
+
+    # فحص أخير: ما نطلّع أي "None" للتطبيق
+    for key in [
+        "given_name_en", "surname_en", "father_name_en",
+        "passport_number", "nationality", "residence_country",
+        "birth_date", "expiry_date", "issue_date", "sex",
+    ]:
+        best_data[key] = safe_text(best_data.get(key))
 
     return best_data
 
 
 # ============================================================================
-# Endpoint فحص الخدمة
+# Endpoints فحص الخدمة (للإيقاظ)
 # ============================================================================
 
 @app.get("/")
-def health_check():
+def root_check():
+    return {"status": "الخدمة شغالة ✓", "ready": True}
 
-    return {
-        "status": "الخدمة شغالة ✓"
-    }
+
+@app.get("/health")
+def health_check():
+    """endpoint خفيف جداً للإيقاظ من التطبيق."""
+    return {"status": "ok", "ready": True}
 
 
 # ============================================================================
@@ -785,38 +956,25 @@ def health_check():
 # ============================================================================
 
 @app.post("/read-passport")
-async def read_passport_endpoint(
-    file: UploadFile = File(...)
-):
+async def read_passport_endpoint(file: UploadFile = File(...)):
 
     try:
 
         image_bytes = await file.read()
 
         if not image_bytes:
-
             return JSONResponse(
                 status_code=400,
-                content={
-                    "success": False,
-                    "error": "الصورة فارغة"
-                }
+                content={"success": False, "error": "الصورة فارغة"},
             )
 
-        result = read_passport_from_bytes(
-            image_bytes
-        )
+        result = read_passport_from_bytes(image_bytes)
 
-        return JSONResponse(
-            content=result
-        )
+        return JSONResponse(content=result)
 
     except Exception as e:
 
         return JSONResponse(
             status_code=500,
-            content={
-                "success": False,
-                "error": f"خطأ داخلي: {str(e)}"
-            }
+            content={"success": False, "error": f"خطأ داخلي: {str(e)}"},
         )
