@@ -25,6 +25,7 @@ main.py — خدمة قراءة الجوازات (FastAPI) — النسخة ال
 """
 
 import re
+import time
 import cv2
 import numpy as np
 import pytesseract
@@ -57,6 +58,14 @@ TESS_CONFIGS = [
 
 # إعداد قراءة النص المطبوع العادي (لتاريخ الإصدار واسم الأب)
 TESS_PRINTED_CONFIG = "--oem 1 --psm 6"
+
+# ============================================================================
+# سقف الوقت — أهم إضافة
+# ============================================================================
+# الخدمة المجانية بطيئة، ولو خليناها تجرب كل الاحتمالات ممكن تاخذ
+# دقائق ويعلّق التطبيق. الخدمة ما تشتغل أكثر من هذا السقف أبداً —
+# ترجع أفضل نتيجة وصلتها وتخلص.
+MAX_SECONDS = 45
 
 
 # ============================================================================
@@ -548,6 +557,52 @@ def extract_issue_date(printed_text: str, birth_date: str, expiry_date: str) -> 
     return f"{best[0]}-{MONTHS[best[1] - 1]}-{best[2]:02d}"
 
 
+def extract_printed_names(printed_text: str):
+    """
+    نستخرج الاسم الأول واللقب من النص المطبوع بوجه الجواز.
+
+    ليش نحتاجها:
+    بعض الجوازات (خاصة الباكستانية) تحط اللقب بس بمنطقة القراءة
+    الآلية بدون الفاصل << والاسم الأول، مثل:
+        P<PAKFARZANA<<<<<<<<<<<
+    بهاي الحالة الاسم الأول موجود بس بالنص المطبوع تحت
+    "Given Names". هذي الدالة تجيبه من هناك.
+    """
+
+    text = (printed_text or "").upper()
+
+    surname = ""
+    given = ""
+
+    # اللقب — تسميات مختلفة حسب البلد
+    surname_match = re.search(
+        r"\bSURNAME\b\s*[:\-]?\s*([A-Z][A-Z\-' ]{1,40})", text
+    )
+    if surname_match:
+        candidate = re.split(
+            r"\b(GIVEN|NAME|NATIONALITY|DATE|SEX|PLACE|FATHER|HUSBAND)\b",
+            surname_match.group(1),
+        )[0]
+        candidate = clean_name_part(candidate)
+        if is_valid_name(candidate):
+            surname = candidate
+
+    # الاسم الأول
+    given_match = re.search(
+        r"\bGIVEN\s*NAMES?\b\s*[:\-]?\s*([A-Z][A-Z\-' ]{1,60})", text
+    )
+    if given_match:
+        candidate = re.split(
+            r"\b(NATIONALITY|DATE|SEX|PLACE|FATHER|HUSBAND|SURNAME|ISSUING|AUTHORITY)\b",
+            given_match.group(1),
+        )[0]
+        candidate = clean_name_part(candidate)
+        if is_valid_name(candidate):
+            given = candidate
+
+    return surname, given
+
+
 def extract_father_name(printed_text: str) -> str:
     """نلقى اسم الأب أو الزوج حسب التسميات المختلفة بالجوازات."""
 
@@ -726,14 +781,53 @@ def try_mrz_candidate(l1, l2):
 # توليد نسخ معالَجة من الصورة
 # ============================================================================
 
-def preprocess_variants(img_bgr):
-    """نولّد نسخ متعددة من الصورة بمعالجات مختلفة."""
+def preprocess_variants(img_bgr, quick=False):
+    """
+    نولّد نسخ معالَجة من الصورة.
+
+    quick=True  -> 9 نسخ فقط (سريعة جداً، تكفي 90% من الحالات)
+    quick=False -> كل النسخ (بطيئة، للحالات الصعبة فقط)
+
+    مهم: هذا التقسيم هو سبب السرعة — بدونه الخدمة تاخذ دقائق
+    وتعلّق التطبيق.
+    """
 
     variants = []
 
     h, w = img_bgr.shape[:2]
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+    # ------------------------------------------------------------------
+    # الوضع السريع: نسب القص الأكثر نجاحاً فقط، بثلاث معالجات
+    # ------------------------------------------------------------------
+    if quick:
+        for crop_ratio in [0.30, 0.35, 0.40]:
+
+            y_start = int(h * (1 - crop_ratio))
+            crop = img_bgr[y_start:h, 0:w]
+
+            if crop.size == 0:
+                continue
+
+            if crop.shape[1] < 1600:
+                scale = 1600 / crop.shape[1]
+                crop = cv2.resize(
+                    crop, None, fx=scale, fy=scale,
+                    interpolation=cv2.INTER_CUBIC
+                )
+
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+            variants.append(gray)
+            variants.append(clahe.apply(gray))
+
+            _, otsu = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            variants.append(otsu)
+
+        return variants
 
     # ------------------------------------------------------------------
     # الصورة كاملة
@@ -767,7 +861,7 @@ def preprocess_variants(img_bgr):
     # قص المنطقة السفلية بنسب مختلفة
     # ------------------------------------------------------------------
 
-    for crop_ratio in [0.25, 0.30, 0.35, 0.40, 0.45, 0.50]:
+    for crop_ratio in [0.30, 0.35, 0.40, 0.45]:
 
         y_start = int(h * (1 - crop_ratio))
 
@@ -805,15 +899,29 @@ def preprocess_variants(img_bgr):
 # معالجة صورة بزاوية وحدة واختيار أفضل نتيجة
 # ============================================================================
 
-def process_image(img_bgr):
-    """نجرب كل النسخ وكل الإعدادات ونرجع أفضل نتيجة."""
+def process_image(img_bgr, deadline=None, quick=False):
+    """
+    نجرب النسخ ونرجع أفضل نتيجة.
+
+    deadline: وقت انتهاء مطلق (time.monotonic) — نوقف عنده مهما كان،
+    حتى ما تعلّق الخدمة والتطبيق ينتظر بلا نهاية.
+    """
 
     best_score = -1
     best_data = None
 
-    for variant in preprocess_variants(img_bgr):
+    configs = TESS_CONFIGS[:1] if quick else TESS_CONFIGS
 
-        for config in TESS_CONFIGS:
+    for variant in preprocess_variants(img_bgr, quick=quick):
+
+        # فحص الوقت قبل كل نسخة
+        if deadline is not None and time.monotonic() > deadline:
+            break
+
+        for config in configs:
+
+            if deadline is not None and time.monotonic() > deadline:
+                break
 
             try:
 
@@ -867,29 +975,63 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
     best_data = None
     best_image = img_bgr
 
-    # نجرب الزوايا بالترتيب — نوقف أول ما نلقى قراءة كاملة
-    rotations = [
-        ("الأصلية", img_bgr),
-        ("180°", cv2.rotate(img_bgr, cv2.ROTATE_180)),
-        ("90°", cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)),
-        ("270°", cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)),
-    ]
+    # ميزانية وقت كلية — الخدمة ما تتجاوزها أبداً، حتى ما يعلّق التطبيق
+    deadline = time.monotonic() + MAX_SECONDS
 
-    for label, rotated in rotations:
+    def better(candidate):
+        """هل هذي النتيجة أفضل من اللي عندنا؟"""
+        if candidate is None:
+            return False
+        if best_data is None:
+            return True
+        return candidate.get("score", 0) > best_data.get("score", 0)
 
-        data = process_image(rotated)
+    # ======================================================================
+    # المرحلة 1: سريعة — الوضع الأصلي بـ9 نسخ فقط
+    # هذي وحدها تنجح بأغلب الصور، وتخلص خلال ثواني
+    # ======================================================================
+    data = process_image(img_bgr, deadline=deadline, quick=True)
 
-        if data is None:
-            continue
+    if better(data):
+        best_data = data
+        best_image = img_bgr
 
-        if best_data is None or data.get("score", 0) > best_data.get("score", 0):
+    if best_data is not None and best_data.get("is_fully_verified"):
+        return _finalize(best_data, best_image)
+
+    # ======================================================================
+    # المرحلة 2: سريعة — الصورة مقلوبة 180 درجة
+    # ======================================================================
+    if time.monotonic() < deadline:
+
+        flipped = cv2.rotate(img_bgr, cv2.ROTATE_180)
+
+        data = process_image(flipped, deadline=deadline, quick=True)
+
+        if better(data):
             best_data = data
-            best_image = rotated
+            best_image = flipped
 
-        # قراءة كاملة (أرقام تحقق + أسماء سليمة) = نوقف فوراً
-        if data.get("is_fully_verified"):
+        if best_data is not None and best_data.get("is_fully_verified"):
+            return _finalize(best_data, best_image)
+
+    # ======================================================================
+    # المرحلة 3: شاملة — كل النسخ، للأصلية والمقلوبة فقط
+    # ما نجرب 90 و270 درجة إطلاقاً: الصور بهذا التطبيق دائماً أفقية،
+    # وتجربتهم كانت تربّع وقت المعالجة بدون أي فائدة عملية
+    # ======================================================================
+    for candidate_image in [img_bgr, cv2.rotate(img_bgr, cv2.ROTATE_180)]:
+
+        if time.monotonic() > deadline:
+            break
+
+        data = process_image(candidate_image, deadline=deadline, quick=False)
+
+        if better(data):
             best_data = data
-            best_image = rotated
+            best_image = candidate_image
+
+        if best_data is not None and best_data.get("is_fully_verified"):
             break
 
     if best_data is None:
@@ -898,11 +1040,21 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
             "error": "ما قدرنا نلقى منطقة قراءة آلية واضحة بالصورة",
         }
 
-    # ------------------------------------------------------------------
-    # النص المطبوع: تاريخ الإصدار واسم الأب/الزوج
-    # ------------------------------------------------------------------
+    return _finalize(best_data, best_image)
+
+
+# ============================================================================
+# اللمسات الأخيرة: النص المطبوع + تنظيف الحقول
+# ============================================================================
+
+def _finalize(best_data, best_image):
+    """نضيف تاريخ الإصدار واسم الأب، وننظف كل الحقول قبل الإرسال."""
 
     try:
+        # نقرا النص المطبوع بس إذا بقى وقت كافي (5 ثواني على الأقل)
+        if time.monotonic() > deadline - 5:
+            raise TimeoutError("ماكو وقت كافي للنص المطبوع")
+
         printed_text = read_printed_text(best_image)
 
         if printed_text:
@@ -921,8 +1073,33 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
             if father:
                 best_data["father_name_en"] = father
 
+            # ==============================================================
+            # احتياطي الأسماء من النص المطبوع
+            # ==============================================================
+            # لو منطقة القراءة الآلية ما أعطت اسم أول (يصير لما ما يكون
+            # بيها الفاصل <<)، نجيبه من النص المطبوع "Given Names"
+            # ==============================================================
+            printed_surname, printed_given = extract_printed_names(printed_text)
+
+            if not best_data.get("given_name_en") and printed_given:
+                best_data["given_name_en"] = printed_given
+
+            if not best_data.get("surname_en") and printed_surname:
+                best_data["surname_en"] = printed_surname
+
+            # حالة خاصة: اللقب والاسم الأول طلعوا نفس الشي من منطقة
+            # القراءة الآلية (لأن ماكو فاصل)، والنص المطبوع يفرّقهم
+            if (
+                printed_given
+                and printed_surname
+                and printed_given != printed_surname
+                and best_data.get("given_name_en") == best_data.get("surname_en")
+            ):
+                best_data["given_name_en"] = printed_given
+                best_data["surname_en"] = printed_surname
+
     except Exception:
-        # فشل قراءة النص المطبوع ما يخرب النتيجة الأساسية
+        # فشل أو انتهى الوقت — النتيجة الأساسية تبقى سليمة
         pass
 
     # فحص أخير: ما نطلّع أي "None" للتطبيق
