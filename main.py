@@ -414,20 +414,6 @@ def clean_name_part(raw: str) -> str:
     return text
 
 
-def _collapse_doubles(text: str) -> str:
-    """
-    ⚠ جديد: نلغي أي حرف مكرر متتالي — نوحّد "ABBAS" و"ABAAS" لنفس
-    الشكل ("ABAS").
-
-    خطأ OCR شائع جداً: يبلع حرف مكرر (BB→B) أو العكس. هذا كان يكسر
-    مطابقة اللقب بـextract_father_by_surname_pattern: لقب صاحب
-    الجواز ينقرا "ABAAS" بمكان، و"ABBAS" بمكان ثاني (نفس الجواز!)،
-    فالمطابقة الحرفية تفشل وتضيع اسم الأب رغم إنه موجود بالصورة.
-    """
-
-    return re.sub(r"(.)\1+", r"\1", text or "")
-
-
 def is_valid_name(name: str) -> bool:
     """فحص جودة الاسم: حرفين على الأقل، أحرف ومسافات بس، مو حرف مكرر."""
 
@@ -577,77 +563,6 @@ def extract_sex_from_line2(l2: str, fields) -> str:
 
 
 # ============================================================================
-# ⚠ إصلاح طول السطر — حرف OCR زايد أو ناقص يزيح كل شي بعده
-# ============================================================================
-# حالة واقعية: خدش أو ضغط بالصورة يخلي Tesseract يقرا حرف زيادة
-# (أو يبلع حرف) بمنتصف السطر الثاني. القص القديم `[:44]` كان يقص
-# من الآخر بعمى — فيبقى الحرف الزايد بمكانه ويطيح آخر حرف حقيقي،
-# فتنزاح كل الحقول اللي بعد موقع الخلل: تاريخ الميلاد، الجنس،
-# تاريخ النفاذ، وكل أرقام التحقق. النتيجة: is_verified/is_checksum_ok
-# يطلع False بدون سبب واضح، والجنس يطلع فاضي حتى إن
-# extract_sex_from_line2 نفسها صحيحة 100% — لأن الحرف اللي تحسبه
-# "موقع 20" مو فعلياً موقع 20 الحقيقي بعد الانزياح.
-#
-# ⚠ ملاحظة: هذا غير شكل "🔴 غير صالح" اللي يطلع بشاشة المراجعة —
-# هذاك عن صلاحية سفر الجواز (أقل من 6 أشهر متبقية)، مو عن صحة
-# القراءة. هذا الإصلاح يتكلم عن is_verified/الجنس اللي يرجعهم main.py
-#
-# ما نقدر نعرف وين بالضبط صار الخلل، فنولّد كل الاحتمالات المعقولة
-# (نحذف/نضيف حرف بكل موقع) ونخلي calculate_score يختار الأصح —
-# نفس فلسفة "جرب كذا نسخة وخذ الأفضل" المستخدمة بكل الملف.
-
-def _length_fix_candidates(raw: str, expected: int = 44, max_variants: int = 40):
-    """نرجّع قائمة احتمالات لسطر طوله مو 44 بالضبط بعد التنظيف.
-
-    أول احتمال دائماً هو نفس السلوك القديم (قص/تبطين بسيط) — لو
-    الإصلاح ما فاد، نضل بنفس النتيجة القديمة، ما نخسر شي.
-    """
-
-    raw = raw or ""
-    variants = [raw[:expected].ljust(expected, "<")]
-
-    diff = len(raw) - expected
-
-    # فرق أكبر من حرفين غالباً خطأ قراءة أعمق (سطر غلط تماماً) —
-    # التجربة العشوائية بهالحالة تضيع وقت أكثر مما تفيد
-    if diff == 0 or abs(diff) > 2:
-        return variants
-
-    if diff > 0:
-        # حرف/حرفين زيادة: نجرب حذفهم من مواقع مختلفة
-        if diff == 1:
-            for i in range(len(raw)):
-                candidate = (raw[:i] + raw[i + 1:])[:expected].ljust(expected, "<")
-                if candidate not in variants:
-                    variants.append(candidate)
-                if len(variants) >= max_variants:
-                    break
-        else:  # diff == 2
-            for i in range(len(raw)):
-                if len(variants) >= max_variants:
-                    break
-                for j in range(i + 1, len(raw)):
-                    candidate = (raw[:i] + raw[i + 1:j] + raw[j + 1:])
-                    candidate = candidate[:expected].ljust(expected, "<")
-                    if candidate not in variants:
-                        variants.append(candidate)
-                    if len(variants) >= max_variants:
-                        break
-    else:
-        # حرف/حرفين ناقصة (غالباً حشو "<" ضاع): نجرب نضيفه بمواقع مختلفة
-        missing = -diff
-        for i in range(len(raw) + 1):
-            candidate = (raw[:i] + ("<" * missing) + raw[i:])
-            candidate = candidate[:expected].ljust(expected, "<")
-            if candidate not in variants:
-                variants.append(candidate)
-            if len(variants) >= max_variants:
-                break
-
-    return variants
-
-
-# ============================================================================
 # استخراج مرشحي MRZ
 # ============================================================================
 
@@ -665,13 +580,14 @@ def extract_mrz_candidates(text: str):
 
     for i in range(len(lines) - 1):
 
-        l1_raw = lines[i]
-        l2_raw = lines[i + 1]
+        l1 = lines[i]
+        l2 = lines[i + 1]
 
-        if len(l1_raw) < 30 or len(l2_raw) < 30:
+        if len(l1) < 30 or len(l2) < 30:
             continue
 
-        l1_44 = l1_raw[:44].ljust(44, "<")
+        l1_44 = l1[:44].ljust(44, "<")
+        l2_44 = l2[:44].ljust(44, "<")
 
         first_ok = (
             l1_44.startswith("P")
@@ -681,15 +597,10 @@ def extract_mrz_candidates(text: str):
             or bool(re.match(r"[A-Z][XK][A-Z]{3}", l1_44))
         )
 
-        if not first_ok:
-            continue
+        second_has_digits = sum(c.isdigit() for c in l2_44) >= 8
 
-        # ⚠ كذا احتمال للسطر الثاني لو طوله انحرف عن 44 — كل واحد
-        # يروح لـtry_mrz_candidate عادي ويتنافس بالنقاط مع البقية
-        for l2_44 in _length_fix_candidates(l2_raw):
-            second_has_digits = sum(c.isdigit() for c in l2_44) >= 8
-            if second_has_digits:
-                candidates.append((l1_44, l2_44))
+        if first_ok and second_has_digits:
+            candidates.append((l1_44, l2_44))
 
     return candidates
 
@@ -1116,8 +1027,7 @@ def reorder_comma_name(raw: str, holder_surname: str) -> str:
     surname = (holder_surname or "").strip().upper()
 
     # نفس لقب صاحب الجواز → ناخذ الأسماء بس
-    # (مقارنة متسامحة مع الحروف المكررة، نفس سبب _collapse_doubles أعلاه)
-    if surname and _collapse_doubles(before_clean) == _collapse_doubles(surname):
+    if surname and before_clean == surname:
         return after_clean
 
     # غير هيك → الأسماء الأولى أول، وبعدها اللقب
@@ -1146,12 +1056,6 @@ def extract_father_by_surname_pattern(printed_text: str, holder_surname: str) ->
     if len(surname) < 3:
         return ""
 
-    # ⚠ نقارن بعد إلغاء الحروف المكررة: نفس الجواز ممكن يعطينا اللقب
-    # "ABAAS" بمكان (من منطقة القراءة الآلية) و"ABBAS" بمكان ثاني
-    # (من النص المطبوع) — نفس الاسم، خطأ OCR بس. مطابقة حرفية تفشل
-    # وتضيع اسم الأب رغم وجوده بوضوح بالصورة
-    surname_key = _collapse_doubles(surname)
-
     for line in (printed_text or "").upper().splitlines():
 
         line = re.sub(r"\s+", " ", line).strip()
@@ -1164,7 +1068,7 @@ def extract_father_by_surname_pattern(printed_text: str, holder_surname: str) ->
         before = line[:comma_index].strip()
         before_words = re.sub(r"[^A-Z ]", " ", before).split()
 
-        if not before_words or _collapse_doubles(before_words[-1]) != surname_key:
+        if not before_words or before_words[-1] != surname:
             continue
 
         candidate = clean_name_part(line[comma_index + 1:])
