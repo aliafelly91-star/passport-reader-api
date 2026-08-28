@@ -4,44 +4,28 @@ main.py — خدمة قراءة الجوازات (FastAPI)
 
 إصلاحات هذي النسخة (بناءً على حالات فشل حقيقية من التطبيق):
 
-9.  حرف الحشو "<" ينقرا **"K"** مو بس "X". حالة واقعية:
-    "ABBAS<<TASSAWAR<K<K<K<KK<KKKK" طلع منها الاسم الأول
-    "TASSAWAR K K K KK KKKK". أضفنا _collapse_filler_letter
-    تشتغل على X و K سوا، + trim_filler_tokens تشيل أي مقاطع
-    ذيلية من حرف واحد مكرر (حزام أمان أخير).
+15. ⚠ حرف الحشو "<" ينقرا كمان **"G"**. حالة واقعية:
+    "ABBAS<<NAZAR<<<<<<<<" طلع منها الاسم الأول
+    "NAZAR G GGGGGGGGGGG". أضفنا G لحروف الحشو — بس بالقواعد
+    السياقية الآمنة بس (تتابع 3+، أو محاصر بحشو)، ما نطبّق عليه
+    قاعدة X القصوى لأن G حرف شرعي جداً بالأسماء (GHULAM).
 
-10. اسم الأب كان يطلع **مقلوب**: الجواز يطبع "HUSSAIN, GHULAM"
-    (لقب، أسماء) والكود كان يشيل الفاصلة بس فيطلع
-    "HUSSAIN GHULAM" بدل "GHULAM HUSSAIN". الحين نعيد الترتيب صح.
+16. ⚠ حرف حشو **ملتصق** بآخر الاسم بدون "<" قبله. حالة واقعية:
+    "TASSAWAR" طلع "TASSAWARK SE S" — الـK التصقت بالاسم مباشرة
+    فما انطبقت عليها أي قاعدة سياقية. الحل: لو انشالت مقاطع خردة
+    من الذيل، وآخر مقطع باقي ينتهي بحرف حشو، نشيل الحرف.
 
-11. اسم الأب وتاريخ الإصدار كانوا يفشلون **سوا** بصور كاملة
-    وواضحة. السبب: read_printed_texts كانت قراءتين بس على منطقة
-    وحدة. لو التسمية ضاعت بهالقراءتين ينتهي كل شي بصمت. الحين:
-      • منطقتين (أعلى 78% + الصورة كاملة) × 3 إعدادات
-      • قراءة كسولة مع توقف فوري أول ما نلقى الحقلين
-      • لو ما لقينا شي، نجرب الصورة مقلوبة 180°
-      • مرساة "مكان الولادة" لاسم الأب — تشتغل حتى لو تسمية
-        Father/Husband ما انقرت إطلاقاً
-      • تاريخ الإصدار: بحث بالتسمية أول، وبعدها الاستنتاج
+17. ⚠ تسمية منقرية غلط تطلع كاسم أب. حالة واقعية:
+    "DATE OF EXPIRY" انقرت "DSTE OF EPRY" فطلعت كاسم أب — لأن
+    الفحص القديم يقارن الكلمات **حرفياً** بقائمة DOCUMENT_WORDS،
+    و"EPRY" مو "EXPIRY". الحين نقارن بمسافة تحرير (Levenshtein).
 
-12. ⚠⚠ الجنس كان يطلع فاضي **دائماً** — ولا مرة وحدة اشتغل!
-    مكتبة mrz ترجّع الجنس ككائن مو حرف، فـstr() يعطي شي مثل
-    "Sex.MALE" أو "male"، والفحص `if sex not in ("M","F")` يفشل
-    كل مرة ويمسح القيمة. الحين نقراه من موقعه المباشر بمعيار
-    TD3 (الخانة 20 بالسطر الثاني). هذا مهم جداً لأن منطق الحالة
-    بالتطبيق (حملة دار / طباخ) ما يشتغل بدون الجنس.
-
-13. تحذير رقم الجواز: لو الرقم ما يطابق نمط بلده المعروف
-    (باكستان: حرفين + 7 أرقام) نحط تنبيه بالنتيجة.
-
-14. ⚠ تكبير النص المطبوع صار 2200 بكسل بدل 1600. التسميات
-    (Father Name / Date of Issue) خطها رمادي ورفيع جداً — أصغر
-    بكثير من حروف منطقة القراءة الآلية، فتحتاج تكبير أقوى.
-    وكمان رفعنا CLAHE لـ2.5 عشان يطلّع الخط الرمادي من خلفية
-    الجواز الملوّنة.
+18. ⚠ مطابقة الاسم مع النص المطبوع. الاسم المطبوع بوجه الجواز
+    خطه أكبر وأوضح من منطقة القراءة الآلية، فلو الاثنين يختلفون
+    بحروف زايدة بالذيل بس، نثق بالمطبوع.
 
 - نفس Endpoint: /read-passport
-- نفس أسماء الحقول اللي ينتظرها Flutter (أضفنا حقول بس)
+- نفس أسماء الحقول اللي ينتظرها Flutter
 """
 
 import re
@@ -77,19 +61,9 @@ TESS_CONFIGS = [
     ),
 ]
 
-# إعدادات قراءة النص المطبوع العادي (لتاريخ الإصدار واسم الأب).
-# psm 6 = كتلة نص موحّدة، psm 4 = أعمدة بأحجام مختلفة،
-# psm 11 = نص متفرق (ينفع لما التسميات مبعثرة بأماكن مختلفة).
-# الجواز مقسّم أعمدة، فكل إعداد يرتّب التسميات مع قيمها بشكل مختلف
 TESS_PRINTED_CONFIGS = ["--oem 1 --psm 6", "--oem 1 --psm 4", "--oem 1 --psm 11"]
 
-# ============================================================================
-# سقف الوقت
-# ============================================================================
 MAX_SECONDS = 45
-
-# نحجز هذي الثواني بالآخر للنص المطبوع (اسم الأب + تاريخ الإصدار).
-# ⚠ رفعناها من 8 لـ14: صرنا نقرا منطقتين بثلاث إعدادات بدل قراءتين
 PRINTED_TEXT_BUDGET = 14
 
 
@@ -179,7 +153,7 @@ MONTHS = [
 ]
 
 MONTH_INDEX = {name: i + 1 for i, name in enumerate(MONTHS)}
-MONTH_INDEX["SEPT"] = 9  # خطأ قراءة شائع
+MONTH_INDEX["SEPT"] = 9
 
 BAD_VALUES = {"NONE", "NULL", "NAN", "N/A", "NA", "-", "--"}
 
@@ -191,14 +165,102 @@ DOCUMENT_WORDS = [
     "GIVEN", "FATHER", "HUSBAND", "GUARDIAN",
 ]
 
+# ⚠ كلمات نقارنها بمسافة تحرير — تمسك القراءة المشوّهة كمان
+# ("EXPIRY" ← "EPRY"، "DATE" ← "DSTE")
+FUZZY_LABEL_WORDS = [
+    "DATE", "OF", "EXPIRY", "ISSUE", "BIRTH", "PLACE", "NAME",
+    "NAMES", "SURNAME", "GIVEN", "FATHER", "HUSBAND", "GUARDIAN",
+    "SEX", "TYPE", "CODE", "COUNTRY", "NUMBER", "NATIONALITY",
+    "AUTHORITY", "TRACKING", "BOOKLET", "CITIZENSHIP", "PASSPORT",
+    "HOLDER", "SIGNATURE", "VALID", "UNTIL", "ISSUING",
+]
+
 # ============================================================================
 # ⚠ حروف Tesseract يخلطها مع حرف الحشو "<"
 # ============================================================================
-# بخط OCR-B، حرف "<" ضيّق ومدبّب. لما الصورة مضغوطة (واتساب/تلغرام)
-# ينقرا "X" أو "K". حالتين واقعيتين انمسكوا:
-#   "KAZMI<<SYED<ALI<<<<"   →  "KAZMIXXSYEDXALIXXXX"
-#   "ABBAS<<TASSAWAR<K<KK"  →  "ABBAS<<TASSAWAR<K<KK"
-FILLER_LETTERS = ("X", "K")
+# بخط OCR-B حرف "<" ضيّق ومدبّب. لما الصورة مضغوطة ينقرا X أو K أو G.
+# ثلاث حالات واقعية انمسكوا:
+#   "KAZMI<<SYED<ALI<<<<"      →  "KAZMIXXSYEDXALIXXXX"
+#   "ABBAS<<TASSAWAR<<<<"      →  "ABBAS<<TASSAWARK<SE<S"
+#   "ABBAS<<NAZAR<<<<<<<<"     →  "ABBAS<<NAZAR<G<GGGGGGG"
+FILLER_LETTERS = ("X", "K", "G")
+
+
+# ============================================================================
+# ⚠ مسافة التحرير — لكشف التسميات المنقرية غلط
+# ============================================================================
+
+def edit_distance(a: str, b: str) -> int:
+    """مسافة Levenshtein بين نصين."""
+
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    previous = list(range(len(b) + 1))
+
+    for i, char_a in enumerate(a, start=1):
+        current = [i]
+        for j, char_b in enumerate(b, start=1):
+            cost = 0 if char_a == char_b else 1
+            current.append(min(
+                previous[j] + 1,        # حذف
+                current[j - 1] + 1,     # إضافة
+                previous[j - 1] + cost  # استبدال
+            ))
+        previous = current
+
+    return previous[-1]
+
+
+def looks_like_label_word(word: str) -> bool:
+    """
+    ⚠ هل هذي الكلمة تسمية بالجواز (حتى لو منقرية غلط)؟
+
+    الفحص القديم كان حرفياً: "EXPIRY" in text. بس Tesseract قرا
+    "EPRY" و"DSTE"، فما انمسكوا وطلعوا كاسم أب.
+
+    نسمح بحرف واحد غلط للكلمات القصيرة، وحرفين للطويلة (6+).
+    """
+
+    word = (word or "").strip().upper()
+
+    if len(word) < 2:
+        return False
+
+    for label in FUZZY_LABEL_WORDS:
+        if word == label:
+            return True
+
+        # فرق الطول كبير → مو نفس الكلمة أصلاً
+        if abs(len(word) - len(label)) > 2:
+            continue
+
+        tolerance = 2 if len(label) >= 6 else 1
+
+        if edit_distance(word, label) <= tolerance:
+            return True
+
+    return False
+
+
+def is_label_noise(value: str) -> bool:
+    """كل كلمات القيمة تسميات → إحنا ماسكين تسمية مو قيمة."""
+
+    text = re.sub(r"\s+", " ", (value or "").strip().upper())
+
+    if not text:
+        return True
+
+    words = [w for w in text.split(" ") if w]
+
+    if not words:
+        return True
+
+    return all(looks_like_label_word(w) for w in words)
 
 
 # ============================================================================
@@ -261,15 +323,15 @@ def fix_digits_in_letters(text: str) -> str:
 
 def _collapse_filler_letter(section: str, letter: str) -> str:
     """
-    ⚠ نحوّل حرف معيّن (X أو K) لحشو "<" حسب السياق.
+    ⚠ نحوّل حرف معيّن (X أو K أو G) لحشو "<" حسب السياق.
 
-    الحرف شرعي بأسماء حقيقية (ALEX، MAX، KHAN، KASHAF)، فما نقدر
-    نحذفه بالجملة. القواعد الآمنة:
-      • تتابع 3 فأكثر → حشو أكيد (ماكو اسم بشري بثلاث K متتالية)
-      • حرف/حرفين **محاصرين بحشو من الجهتين** ("<K<") → حشو
+    الحرف شرعي بأسماء حقيقية (ALEX، KHAN، GHULAM)، فما نقدر نحذفه
+    بالجملة. القواعد الآمنة:
+      • تتابع 3 فأكثر → حشو أكيد (ماكو اسم بشري بثلاث G متتالية)
+      • حرف/حرفين **محاصرين بحشو من الجهتين** ("<G<") → حشو
       • حرف/حرفين ملتصقين بحشو بآخر المقطع ("…ALI<KK") → حشو
 
-    نكرر لين يستقر النص، لأن "<K<K<K<" متداخلة وجولة وحدة ما تكفيها
+    نكرر لين يستقر النص، لأن "<G<G<G<" متداخلة وجولة وحدة ما تكفيها
     """
 
     if letter not in section:
@@ -309,8 +371,9 @@ def normalize_name_fillers(names_section: str) -> str:
     """
     نصلّح حروف الحشو المقروءة غلط بمقطع الأسماء.
 
-    نبدأ بـX (الحالة الأشيع وأخطر، لأن ممكن ما يبقى ولا "<" بالمقطع
-    إطلاقاً)، وبعدها K.
+    ⚠ قاعدة X القصوى (استبدال كل X بحشو) تنطبق على **X بس** —
+    لأن X نادر جداً بأسماء الجوازات اللي نشتغل عليها. أما K وG
+    فشرعيين تماماً (KHAN، GHULAM)، فما ناخذ إلا القواعد السياقية.
     """
 
     section = names_section or ""
@@ -323,8 +386,7 @@ def normalize_name_fillers(names_section: str) -> str:
     # ------------------------------------------------------------------
     # ⚠ لازم نحسبها على النص **الأصلي** قبل أي تعديل — لأن خطوة
     # التحويل نفسها تنتج "<<" جديدة، ولو حسبناها بعدها ينقلب المنطق.
-    # خانة الأسماء بمعيار TD3 طولها 39 خانة ودائماً بيها حشو بالآخر،
-    # فلو ماكو ولا "<" معناها كل الحشو انقرا X
+    # خانة الأسماء بمعيار TD3 طولها 39 خانة ودائماً بيها حشو بالآخر
     if "<" not in section and "X" in section:
         section = section.replace("X", "<")
 
@@ -339,7 +401,7 @@ def normalize_mrz_line1(l1: str) -> str:
     نصلّح السطر الأول قبل التحليل:
       • "PXPAK" → "P<PAK"
       • رمز الدولة (خانات 2-4) حروف بس
-      • مقطع الأسماء: أرقام → حروف، وبعدين X/K → حشو
+      • مقطع الأسماء: أرقام → حروف، وبعدين X/K/G → حشو
 
     آمن تماماً: أرقام التحقق بمعيار TD3 كلها محسوبة من **السطر
     الثاني** بس، فتعديل السطر الأول ما يأثر عليها إطلاقاً.
@@ -350,7 +412,7 @@ def normalize_mrz_line1(l1: str) -> str:
 
     head = l1[:5]
 
-    if len(head) >= 2 and head[1] in ("X", "K"):
+    if len(head) >= 2 and head[1] in FILLER_LETTERS:
         head = head[0] + "<" + head[2:]
 
     head = head[:2] + fix_digits_in_letters(head[2:])
@@ -366,31 +428,51 @@ def normalize_mrz_line1(l1: str) -> str:
 
 def trim_filler_tokens(name: str) -> str:
     """
-    ⚠ حزام أمان أخير: نشيل المقاطع الذيلية اللي كلها حرف واحد مكرر.
+    ⚠ حزام أمان: نشيل المقاطع الذيلية الخردة.
 
-    حالة واقعية: "TASSAWAR K K K KK KKKK" — حروف حشو نجت من كل
-    التصحيحات اللي فوق (لأن الصورة مضغوطة والحشو انقرا متقطّع).
+    حالتين واقعيتين:
+      "NAZAR G GGGGGGGGGGG"  ← حشو انقرا G متقطّع
+      "TASSAWARK SE S"       ← حشو انقرا K وS بأشكال مختلفة
 
-    ليش من الذيل بس؟ لأن الأسماء الحقيقية أحياناً بيها مقطع حرف
-    واحد **بالوسط** ("SHUHDA E FATIMA" — الـE جزء من الاسم)، بس
-    ما تنتهي بمقطع مكرر. وأول ما نلقى مقطع حقيقي نوقف
+    نشيل من الذيل:
+      • أي مقطع كله نفس الحرف وهذا الحرف من حروف الحشو (GGGG، KK)
+      • أي مقطع من حرف واحد وهو حرف حشو (G، K، X)
+      • مقطع من حرفين أو أقل **بشرط** إنه جا بعد مقطع خردة (يعني
+        إحنا أصلاً بمنطقة حشو) — هيك ما نأذي "SHUHDA E FATIMA"
+
+    ⚠ وبالآخر: لو انشال أي شي، وآخر مقطع باقي **ينتهي بحرف حشو**
+    وطوله 5 فأكثر، نشيل الحرف — هذي حالة "TASSAWARK" اللي الـK
+    التصقت بالاسم مباشرة بدون "<" قبلها فما انطبقت عليها أي قاعدة
+    سياقية بـ_collapse_filler_letter
     """
 
     tokens = (name or "").split()
+    removed_any = False
 
     while tokens:
         last = tokens[-1]
 
-        # كله نفس الحرف؟ (K، KK، KKKK، XX…)
-        if len(set(last)) != 1:
+        # مقطع كله نفس الحرف
+        if len(set(last)) == 1:
+            # حرف واحد مكرر: نشيله لو حرف حشو، أو لو أطول من حرفين
+            if last[0] in FILLER_LETTERS or len(last) >= 3:
+                tokens.pop()
+                removed_any = True
+                continue
             break
 
-        # مقطع من حرف واحد: نشيله بس لو الحرف من حروف الحشو المعروفة
-        # (نحمي "SHUHDA E" لو انقلبت للذيل)
-        if len(last) == 1 and last not in FILLER_LETTERS:
-            break
+        # مقطع قصير جداً بعد ما شلنا خردة → غالباً بقايا حشو
+        if removed_any and len(last) <= 2:
+            tokens.pop()
+            continue
 
-        tokens.pop()
+        break
+
+    # ⚠ حرف حشو ملتصق بآخر الاسم (TASSAWARK → TASSAWAR)
+    if removed_any and tokens:
+        last = tokens[-1]
+        if len(last) >= 5 and last[-1] in FILLER_LETTERS:
+            tokens[-1] = last[:-1]
 
     return " ".join(tokens)
 
@@ -416,13 +498,11 @@ def clean_name_part(raw: str) -> str:
 
 def _collapse_doubles(text: str) -> str:
     """
-    ⚠ جديد: نلغي أي حرف مكرر متتالي — نوحّد "ABBAS" و"ABAAS" لنفس
-    الشكل ("ABAS").
+    نلغي أي حرف مكرر متتالي — نوحّد "ABBAS" و"ABAAS" لنفس الشكل.
 
     خطأ OCR شائع جداً: يبلع حرف مكرر (BB→B) أو العكس. هذا كان يكسر
-    مطابقة اللقب بـextract_father_by_surname_pattern: لقب صاحب
-    الجواز ينقرا "ABAAS" بمكان، و"ABBAS" بمكان ثاني (نفس الجواز!)،
-    فالمطابقة الحرفية تفشل وتضيع اسم الأب رغم إنه موجود بالصورة.
+    مطابقة اللقب: لقب صاحب الجواز ينقرا "ABAAS" بمكان و"ABBAS"
+    بمكان ثاني (نفس الجواز!)، فالمطابقة الحرفية تفشل
     """
 
     return re.sub(r"(.)\1+", r"\1", text or "")
@@ -448,8 +528,9 @@ def is_plausible_person_name(name: str) -> bool:
     """
     حارس أقوى من is_valid_name — لاسم الأب تحديداً.
 
-    يرفض رموز الدول وكلمات هيكل الجواز، لأن هذي كانت تطلع كأسماء
-    أب بالتطبيق ("PAK"، "COUNTY COD")
+    ⚠ الإضافة: فحص التسميات بمسافة تحرير. الفحص القديم كان يقارن
+    حرفياً بـDOCUMENT_WORDS، فـ"DSTE OF EPRY" (قراءة مشوّهة لـ
+    "DATE OF EXPIRY") عبرت وطلعت كاسم أب بالتطبيق
     """
 
     if not name:
@@ -463,8 +544,21 @@ def is_plausible_person_name(name: str) -> bool:
     if clean.replace(" ", "") in COUNTRY_NAMES:
         return False
 
+    # مطابقة حرفية (سريعة)
     for word in DOCUMENT_WORDS:
         if word in clean:
+            return False
+
+    # ⚠ مطابقة متسامحة — تمسك التسميات المنقرية غلط
+    if is_label_noise(clean):
+        return False
+
+    # ⚠ كلمة "OF" وسط القيمة = تسمية شبه أكيدة ("DATE OF EXPIRY")
+    words = clean.split()
+    if len(words) >= 2 and any(looks_like_label_word(w) for w in words):
+        # لو **أكثر من نص** الكلمات تسميات → مو اسم شخص
+        label_count = sum(1 for w in words if looks_like_label_word(w))
+        if label_count * 2 >= len(words):
             return False
 
     return is_valid_name(clean)
@@ -501,8 +595,7 @@ def parse_names_from_line1(l1: str):
     # ⚠ خطة احتياطية: الفاصل "<<" انقرا حرف
     # ------------------------------------------------------------------
     # حالة واقعية: "P<PAKABBASIK<ZAHIDA<PARVEEN" — الفاصل بعد ABBASI
-    # انقرا "K<"، فاللقب أخذ كل شي والاسم الأول طلع فاضي.
-    # لو صار هيك ننقسم على "<" المفرد: أول مقطع لقب والباقي أسماء أولى
+    # انقرا "K<"، فاللقب أخذ كل شي والاسم الأول طلع فاضي
     if not given_names and "<" in parts[0]:
         tokens = [t for t in parts[0].split("<") if t]
         if len(tokens) >= 2:
@@ -533,26 +626,55 @@ def extract_names(fields, l1: str):
 
 
 # ============================================================================
+# ⚠ مطابقة اسم الـMRZ مع الاسم المطبوع
+# ============================================================================
+
+def reconcile_name(from_mrz: str, from_printed: str) -> str:
+    """
+    ⚠ الاسم المطبوع بوجه الجواز خطه أكبر وأوضح بكثير من منطقة
+    القراءة الآلية. فلو الاثنين يختلفون بحروف زايدة بالذيل بس،
+    نثق بالمطبوع.
+
+    حالة واقعية: MRZ أعطى "TASSAWARK" والمطبوع "TASSAWAR" —
+    الحرف الزايد من الفاصل المنقري غلط.
+
+    ما نستبدل إلا بشروط ضيقة، عشان ما نخرب اسم صحيح باسم مطبوع
+    منقري غلط
+    """
+
+    mrz = (from_mrz or "").strip().upper()
+    printed = (from_printed or "").strip().upper()
+
+    if not printed or not is_valid_name(printed) or is_label_noise(printed):
+        return mrz
+
+    if not mrz:
+        return printed
+
+    if mrz == printed:
+        return mrz
+
+    # المطبوع بادئة للـMRZ وفرق حرف أو حرفين → حشو زايد بالـMRZ
+    if mrz.startswith(printed) and len(mrz) - len(printed) <= 2:
+        return printed
+
+    # فرق حرف واحد والمطبوع مو أطول → نثق بالمطبوع
+    if len(printed) <= len(mrz) and edit_distance(mrz, printed) <= 1:
+        return printed
+
+    return mrz
+
+
+# ============================================================================
 # ⚠ الجنس — من موقعه المباشر بالسطر الثاني
 # ============================================================================
 
 def extract_sex_from_line2(l2: str, fields) -> str:
     """
-    ⚠⚠ الجنس كان يطلع فاضي **دائماً** — ولا مرة وحدة اشتغل!
+    الجنس من موقعه المباشر بمعيار TD3 — الخانة رقم 20 بالسطر الثاني
+    (M / F / < للغير محدد). أوثق من المكتبة، ونستخدمها كاحتياطي بس.
 
-    السبب: مكتبة mrz ترجّع الجنس ككائن مو حرف، فـstr() يعطي شي
-    مثل "Sex.MALE" أو "male" — والفحص القديم:
-
-        sex = safe_text(getattr(fields, "sex", "")).upper()
-        if sex not in ("M", "F"):
-            sex = ""              ← يمسحه كل مرة
-
-    كان يفشل دائماً ويمسح القيمة. وهذا خطير: منطق "الحالة"
-    بالتطبيق (حملة دار / طباخ للرجال بس) ما يشتغل بدون الجنس.
-
-    الحل: نقراه من موقعه المباشر بمعيار TD3 — الخانة رقم 20
-    بالسطر الثاني (M / F / < للغير محدد). هذا أوثق من المكتبة
-    أصلاً، ونستخدم المكتبة كاحتياطي بس
+    منطق "الحالة" بالتطبيق (حملة دار / طباخ للرجال) ما يشتغل بدونه
     """
 
     # 1. الموقع المباشر بمعيار TD3 (الأوثق)
@@ -579,42 +701,19 @@ def extract_sex_from_line2(l2: str, fields) -> str:
 # ============================================================================
 # ⚠ إصلاح طول السطر — حرف OCR زايد أو ناقص يزيح كل شي بعده
 # ============================================================================
-# حالة واقعية: خدش أو ضغط بالصورة يخلي Tesseract يقرا حرف زيادة
-# (أو يبلع حرف) بمنتصف السطر الثاني. القص القديم `[:44]` كان يقص
-# من الآخر بعمى — فيبقى الحرف الزايد بمكانه ويطيح آخر حرف حقيقي،
-# فتنزاح كل الحقول اللي بعد موقع الخلل: تاريخ الميلاد، الجنس،
-# تاريخ النفاذ، وكل أرقام التحقق. النتيجة: is_verified/is_checksum_ok
-# يطلع False بدون سبب واضح، والجنس يطلع فاضي حتى إن
-# extract_sex_from_line2 نفسها صحيحة 100% — لأن الحرف اللي تحسبه
-# "موقع 20" مو فعلياً موقع 20 الحقيقي بعد الانزياح.
-#
-# ⚠ ملاحظة: هذا غير شكل "🔴 غير صالح" اللي يطلع بشاشة المراجعة —
-# هذاك عن صلاحية سفر الجواز (أقل من 6 أشهر متبقية)، مو عن صحة
-# القراءة. هذا الإصلاح يتكلم عن is_verified/الجنس اللي يرجعهم main.py
-#
-# ما نقدر نعرف وين بالضبط صار الخلل، فنولّد كل الاحتمالات المعقولة
-# (نحذف/نضيف حرف بكل موقع) ونخلي calculate_score يختار الأصح —
-# نفس فلسفة "جرب كذا نسخة وخذ الأفضل" المستخدمة بكل الملف.
 
 def _length_fix_candidates(raw: str, expected: int = 44, max_variants: int = 40):
-    """نرجّع قائمة احتمالات لسطر طوله مو 44 بالضبط بعد التنظيف.
-
-    أول احتمال دائماً هو نفس السلوك القديم (قص/تبطين بسيط) — لو
-    الإصلاح ما فاد، نضل بنفس النتيجة القديمة، ما نخسر شي.
-    """
+    """نرجّع قائمة احتمالات لسطر طوله مو 44 بالضبط بعد التنظيف."""
 
     raw = raw or ""
     variants = [raw[:expected].ljust(expected, "<")]
 
     diff = len(raw) - expected
 
-    # فرق أكبر من حرفين غالباً خطأ قراءة أعمق (سطر غلط تماماً) —
-    # التجربة العشوائية بهالحالة تضيع وقت أكثر مما تفيد
     if diff == 0 or abs(diff) > 2:
         return variants
 
     if diff > 0:
-        # حرف/حرفين زيادة: نجرب حذفهم من مواقع مختلفة
         if diff == 1:
             for i in range(len(raw)):
                 candidate = (raw[:i] + raw[i + 1:])[:expected].ljust(expected, "<")
@@ -622,7 +721,7 @@ def _length_fix_candidates(raw: str, expected: int = 44, max_variants: int = 40)
                     variants.append(candidate)
                 if len(variants) >= max_variants:
                     break
-        else:  # diff == 2
+        else:
             for i in range(len(raw)):
                 if len(variants) >= max_variants:
                     break
@@ -634,7 +733,6 @@ def _length_fix_candidates(raw: str, expected: int = 44, max_variants: int = 40)
                     if len(variants) >= max_variants:
                         break
     else:
-        # حرف/حرفين ناقصة (غالباً حشو "<" ضاع): نجرب نضيفه بمواقع مختلفة
         missing = -diff
         for i in range(len(raw) + 1):
             candidate = (raw[:i] + ("<" * missing) + raw[i:])
@@ -677,15 +775,13 @@ def extract_mrz_candidates(text: str):
             l1_44.startswith("P")
             or l1_44.startswith("<<P")
             or "P<" in l1_44[:5]
-            # حالة الحشو المقروء X أو K: "PXPAK…" / "PKPAK…"
-            or bool(re.match(r"[A-Z][XK][A-Z]{3}", l1_44))
+            # حالة الحشو المقروء X/K/G: "PXPAK…" / "PKPAK…" / "PGPAK…"
+            or bool(re.match(r"[A-Z][XKG][A-Z]{3}", l1_44))
         )
 
         if not first_ok:
             continue
 
-        # ⚠ كذا احتمال للسطر الثاني لو طوله انحرف عن 44 — كل واحد
-        # يروح لـtry_mrz_candidate عادي ويتنافس بالنقاط مع البقية
         for l2_44 in _length_fix_candidates(l2_raw):
             second_has_digits = sum(c.isdigit() for c in l2_44) >= 8
             if second_has_digits:
@@ -794,12 +890,9 @@ def _prepare_printed_region(img_bgr, top_ratio):
     """
     نجهّز منطقة من الصورة لقراءة النص المطبوع.
 
-    ⚠ التسميات المطبوعة (Father Name / Date of Issue) خطها رمادي
-    ورفيع جداً — أصغر بكثير من حروف منطقة القراءة الآلية. فتحتاج
-    تكبير أقوى: 2200 بكسل بدل 1600.
-
-    وكمان: نكبّر **دائماً** لو الصورة أصغر من الهدف، وما نصغّرها
-    أبداً لو أكبر — أي تصغير يمحي الخطوط الرفيعة نهائياً
+    التسميات المطبوعة (Father Name / Date of Issue) خطها رمادي
+    ورفيع جداً — أصغر بكثير من حروف منطقة القراءة الآلية، فتحتاج
+    تكبير أقوى: 2200 بكسل. ونكبّر دائماً لو أصغر، وما نصغّر أبداً
     """
 
     h, w = img_bgr.shape[:2]
@@ -809,7 +902,6 @@ def _prepare_printed_region(img_bgr, top_ratio):
     if region.size == 0:
         return None
 
-    # 2200 بكسل — التسميات المطبوعة تحتاج تكبير أكثر من الـMRZ
     target_width = 2200
 
     if region.shape[1] < target_width:
@@ -821,8 +913,6 @@ def _prepare_printed_region(img_bgr, top_ratio):
 
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
 
-    # CLAHE يرفع تباين المناطق المحلية — يطلّع الخط الرمادي الرفيع
-    # من الخلفية الملونة للجواز
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 
     return clahe.apply(gray)
@@ -830,21 +920,14 @@ def _prepare_printed_region(img_bgr, top_ratio):
 
 def iter_printed_texts(img_bgr, deadline=None):
     """
-    ⚠ مولّد (generator) يرجّع نصوص النص المطبوع **وحدة وحدة**.
+    مولّد يرجّع نصوص النص المطبوع **وحدة وحدة**.
 
-    نرجّع كل قراءة لحالها، ما ندمجهم بنص واحد أبداً! لأن المحلل
-    يشتغل بمنطق "التسمية بسطر والقيمة بالسطر اللي بعده". لو لصقنا
-    نصين، آخر سطر بالقراءة الأولى يصير جار أول سطر بالقراءة الثانية
-    — وهما من مكانين مختلفين تماماً بالصورة. (هذا بالضبط اللي طلّع
-    اسم أب "COUNTY COD" بالتطبيق)
-
-    ⚠ ليش مولّد مو قائمة؟ عشان نوقف فوراً أول ما نلقى اللي نريده،
-    بدل ما نستهلك كل القراءات الست ونضيع الوقت. القراءة الوحدة
-    تاخذ ثانيتين تقريباً
+    ما ندمجهم بنص واحد أبداً! لأن المحلل يشتغل بمنطق "التسمية بسطر
+    والقيمة بالسطر اللي بعده". لو لصقنا نصين، آخر سطر بالقراءة
+    الأولى يصير جار أول سطر بالقراءة الثانية — وهما من مكانين
+    مختلفين تماماً بالصورة
     """
 
-    # منطقتين: أعلى 78% (منطقة البيانات)، والصورة كاملة (احتياطي —
-    # بعض الصور مقصوصة أو الجواز مايل، فالنسبة الثابتة تقطع سطور)
     for top_ratio in (0.78, 1.0):
 
         try:
@@ -891,7 +974,6 @@ def find_printed_dates(printed_text: str):
         if value not in found:
             found.append(value)
 
-    # 14 SEP 2023
     for match in re.finditer(
         r"\b(\d{1,2})\s*[-/ ]?\s*([A-Z]{3,4})\s*[-/ ]?\s*(\d{4})\b", text
     ):
@@ -899,7 +981,6 @@ def find_printed_dates(printed_text: str):
         if month:
             add(int(match.group(3)), month, int(match.group(1)))
 
-    # SEP 14 2023
     for match in re.finditer(
         r"\b([A-Z]{3,4})\s*[-/ ]?\s*(\d{1,2})\s*[-/ ]?\s*(\d{4})\b", text
     ):
@@ -907,11 +988,9 @@ def find_printed_dates(printed_text: str):
         if month:
             add(int(match.group(3)), month, int(match.group(2)))
 
-    # 2023-09-14
     for match in re.finditer(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b", text):
         add(int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
-    # 14/09/2023
     for match in re.finditer(r"\b(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})\b", text):
         add(int(match.group(3)), int(match.group(2)), int(match.group(1)))
 
@@ -920,10 +999,7 @@ def find_printed_dates(printed_text: str):
 
 def extract_issue_date_by_label(printed_text: str, birth_date: str, expiry_date: str) -> str:
     """
-    ⚠ جديد: نبحث عن تاريخ الإصدار **بتسميته مباشرة** قبل أي استنتاج.
-
-    "Date of Issue" ثم "08 FEB 2023" — أوضح وأدق بكثير من الاستنتاج،
-    وتشتغل حتى لو التواريخ المطبوعة ناقصة أو زايدة.
+    نبحث عن تاريخ الإصدار **بتسميته مباشرة** قبل أي استنتاج.
 
     ⚠ ننتبه: "Place of Issue" مو "Date of Issue"! فنستبعد أي سطر
     فيه PLACE — وإلا نجيب تاريخ من مكان غلط
@@ -946,7 +1022,6 @@ def extract_issue_date_by_label(printed_text: str, birth_date: str, expiry_date:
         if "PLACE" in line:
             continue
 
-        # نفحص نفس السطر والسطرين اللي بعده
         for j in range(i, min(i + 3, len(lines))):
 
             for value in find_printed_dates(lines[j]):
@@ -974,10 +1049,7 @@ def extract_issue_date(printed_text: str, birth_date: str, expiry_date: str) -> 
     منطقة القراءة الآلية تعطينا الميلاد والنفاذ مؤكدين رياضياً،
     فالتاريخ الثالث المطبوع = تاريخ الإصدار.
 
-    الترتيب: البحث بالتسمية أول (الأدق)، وبعدها الاستنتاج.
-
-    ⚠ الاستنتاج يستخدم إن الجوازات تنصدر بصلاحية **5 أو 10 سنين**،
-    فنختار المرشح اللي الفرق بينه وبين النفاذ أقرب لوحدة من هالمدتين
+    الترتيب: البحث بالتسمية أول (الأدق)، وبعدها الاستنتاج
     """
 
     by_label = extract_issue_date_by_label(printed_text, birth_date, expiry_date)
@@ -1044,9 +1116,9 @@ def extract_printed_names(printed_text: str):
     """
     نستخرج الاسم الأول واللقب من النص المطبوع بوجه الجواز.
 
-    بعض الجوازات تحط اللقب بس بمنطقة القراءة الآلية بدون الفاصل 
-    والاسم الأول (P<PAKFARZANA<<<<) — بهاي الحالة الاسم الأول موجود
-    بس بالنص المطبوع تحت "Given Names"
+    فايدتها مزدوجة:
+      • بعض الجوازات تحط اللقب بس بمنطقة القراءة الآلية بدون الفاصل
+      • ونستخدمها كمان لمطابقة اسم الـMRZ (reconcile_name)
     """
 
     text = (printed_text or "").upper()
@@ -1063,7 +1135,7 @@ def extract_printed_names(printed_text: str):
             surname_match.group(1),
         )[0]
         candidate = clean_name_part(candidate)
-        if is_valid_name(candidate):
+        if is_valid_name(candidate) and not is_label_noise(candidate):
             surname = candidate
 
     given_match = re.search(
@@ -1075,7 +1147,7 @@ def extract_printed_names(printed_text: str):
             given_match.group(1),
         )[0]
         candidate = clean_name_part(candidate)
-        if is_valid_name(candidate):
+        if is_valid_name(candidate) and not is_label_noise(candidate):
             given = candidate
 
     return surname, given
@@ -1083,18 +1155,14 @@ def extract_printed_names(printed_text: str):
 
 def reorder_comma_name(raw: str, holder_surname: str) -> str:
     """
-    ⚠ إصلاح مهم: نمط "اللقب، الأسماء" لازم ينقلب.
+    نمط "اللقب، الأسماء" لازم ينقلب.
 
     الجواز الباكستاني يطبع اسم الأب/الزوج بصيغة SURNAME, GIVEN NAMES:
         "HUSSAIN, GHULAM"      →  الاسم الحقيقي: GHULAM HUSSAIN
-        "SYED, AIJAZ HUSSAIN"  →  الاسم الحقيقي: AIJAZ HUSSAIN SYED
-
-    الكود القديم كان يشيل الفاصلة بس ويترك الترتيب، فيطلع
-    "HUSSAIN GHULAM" — مقلوب تماماً.
+        "AHMED, NABI"          →  الاسم الحقيقي: NABI AHMED
 
     استثناء: لو اللقب قبل الفاصلة هو **نفسه لقب صاحب الجواز**،
     نرجّع اللي بعد الفاصلة بس — لأن اللقب موجود أصلاً بحقل SURNAME
-    وتكراره حشو بلا فايدة
     """
 
     text = (raw or "").strip()
@@ -1116,7 +1184,6 @@ def reorder_comma_name(raw: str, holder_surname: str) -> str:
     surname = (holder_surname or "").strip().upper()
 
     # نفس لقب صاحب الجواز → ناخذ الأسماء بس
-    # (مقارنة متسامحة مع الحروف المكررة، نفس سبب _collapse_doubles أعلاه)
     if surname and _collapse_doubles(before_clean) == _collapse_doubles(surname):
         return after_clean
 
@@ -1129,16 +1196,10 @@ def extract_father_by_surname_pattern(printed_text: str, holder_surname: str) ->
     نمط "لقب صاحب الجواز، الأسماء" — الحالة الأوضح.
 
       • صاحب الجواز BUGHIO  →  "BUGHIO, MAZHAR HUSSAIN"
-      • صاحب الجواز SHAMSI  →  "SHAMSI, SYED NAYYAR TOUQIR IRTAZA"
+      • صاحب الجواز ABBAS   →  "AHMED, NABI"
 
     تشتغل **حتى لو تسمية "Father Name" ما انقرت أصلاً** — وهذي
-    بالضبط الحالة اللي كانت تخلي الحقل فاضي، لأن التسمية مطبوعة
-    بخط رمادي صغير وTesseract يضيّعها كثير.
-
-    ⚠ خفّفنا الشرط: كان يطلب تطابق **تام** لكل اللي قبل الفاصلة مع
-    اللقب. بس Tesseract غالباً يلصق التسمية بنفس السطر
-    ("Husband Name SYED, AIJAZ HUSSAIN")، فالتطابق التام يفشل.
-    الحين يكفي إن اللقب يكون **آخر كلمة** قبل الفاصلة
+    بالضبط الحالة اللي كانت تخلي الحقل فاضي
     """
 
     surname = (holder_surname or "").strip().upper()
@@ -1146,10 +1207,6 @@ def extract_father_by_surname_pattern(printed_text: str, holder_surname: str) ->
     if len(surname) < 3:
         return ""
 
-    # ⚠ نقارن بعد إلغاء الحروف المكررة: نفس الجواز ممكن يعطينا اللقب
-    # "ABAAS" بمكان (من منطقة القراءة الآلية) و"ABBAS" بمكان ثاني
-    # (من النص المطبوع) — نفس الاسم، خطأ OCR بس. مطابقة حرفية تفشل
-    # وتضيع اسم الأب رغم وجوده بوضوح بالصورة
     surname_key = _collapse_doubles(surname)
 
     for line in (printed_text or "").upper().splitlines():
@@ -1175,22 +1232,65 @@ def extract_father_by_surname_pattern(printed_text: str, holder_surname: str) ->
     return ""
 
 
+def extract_father_by_comma_line(printed_text: str, holder_surname: str) -> str:
+    """
+    ⚠ جديد: أي سطر بصيغة "كلمة، كلمات" — حتى لو اللقب قبل الفاصلة
+    مو لقب صاحب الجواز.
+
+    حالة واقعية: صاحبة جواز لقبها ZAHRA وخانة الزوج فيها
+    "SHAMSI, SYED NAYYAR" — لقب الزوج مختلف تماماً.
+
+    الحارس: نستبعد السطور اللي فيها تاريخ أو تسميات، ونستبعد
+    "مكان الولادة" (لأن اللي بعد فاصلته دولة مو اسم)
+    """
+
+    lines = [
+        re.sub(r"\s+", " ", line).strip().upper()
+        for line in (printed_text or "").splitlines()
+        if line.strip()
+    ]
+
+    for line in lines:
+
+        if "," not in line:
+            continue
+
+        # سطر فيه تاريخ → مو سطر اسم
+        if find_printed_dates(line):
+            continue
+
+        before, after = line.split(",", 1)
+
+        after_clean = clean_name_part(after)
+
+        # اللي بعد الفاصلة دولة → هذا مكان الولادة مو اسم أب
+        if after_clean.replace(" ", "") in COUNTRY_NAMES:
+            continue
+        if after_clean.replace(" ", "") in COUNTRY_NAMES.values():
+            continue
+
+        name = reorder_comma_name(line, holder_surname)
+
+        if is_plausible_person_name(name):
+            return name
+
+    return ""
+
+
 def extract_father_by_place_anchor(printed_text: str) -> str:
     """
-    ⚠ جديد: مرساة "مكان الولادة".
+    مرساة "مكان الولادة".
 
     ترتيب حقول الجواز الباكستاني ثابت ومطبوع بنفس العمود:
 
         Sex          Place of Birth
-        F            LAHORE, PAK          ← المرساة
-        Husband Name
-        SYED, AIJAZ HUSSAIN               ← القيمة اللي نريدها
+        M            SIALKOT, PAK         ← المرساة
+        Father Name
+        AHMED, NABI                       ← القيمة اللي نريدها
         Date of Issue
-        15 MAY 2017                       ← نوقف هنا
+        16 AUG 2022                       ← نوقف هنا
 
-    فايدتها: تشتغل حتى لو تسمية Father/Husband ما انقرت **إطلاقاً**،
-    وكمان لو اللقب قبل الفاصلة مو لقب صاحب الجواز (لقب الزوج).
-    هذي كانت الحالة بجوازين من أربعة انفحصوا
+    فايدتها: تشتغل حتى لو تسمية Father/Husband ما انقرت **إطلاقاً**
     """
 
     lines = [
@@ -1215,12 +1315,10 @@ def extract_father_by_place_anchor(printed_text: str) -> str:
         if not match:
             continue
 
-        # لازم اللي بعد الفاصلة يكون دولة، مو اسم شخص
         tail = match.group(2).replace(" ", "")
         if tail not in COUNTRY_NAMES and tail not in COUNTRY_NAMES.values():
             continue
 
-        # ندور على القيمة بالسطور الثلاثة اللي بعده
         for j in range(i + 1, min(i + 4, len(lines))):
 
             candidate_line = lines[j]
@@ -1229,7 +1327,6 @@ def extract_father_by_place_anchor(printed_text: str) -> str:
             if find_printed_dates(candidate_line):
                 break
 
-            # نشيل بادئة التسمية لو انلصقت بنفس السطر
             candidate_line = re.sub(
                 r"^(FATHER|HUSBAND|GUARDIAN|MOTHER|SPOUSE)[^A-Z]*(NAME)?[^A-Z]*",
                 "",
@@ -1245,7 +1342,7 @@ def extract_father_by_place_anchor(printed_text: str) -> str:
 
 
 def extract_father_name(printed_text: str, holder_surname: str = "") -> str:
-    """نلقى اسم الأب أو الزوج — بثلاث طرق مرتبة حسب الدقة."""
+    """نلقى اسم الأب أو الزوج — بأربع طرق مرتبة حسب الدقة."""
 
     # 1. النمط "لقب صاحب الجواز، الأسماء" (الأدق)
     by_pattern = extract_father_by_surname_pattern(printed_text, holder_surname)
@@ -1265,21 +1362,25 @@ def extract_father_name(printed_text: str, holder_surname: str = "") -> str:
 
         raw = match.group(1)
 
-        # نقطع عند أول تسمية ثانية
         raw = re.split(
             r"\b(DATE|PLACE|SEX|NATIONALITY|ISSUING|TRACKING|BOOKLET"
             r"|PASSPORT|AUTHORITY|CITIZENSHIP|COUNTRY|COUNTY|CODE|TYPE)\b",
             raw,
         )[0]
 
-        # ⚠ هنا كان يطلع الاسم مقلوب — reorder_comma_name تصلّحه
         name = reorder_comma_name(raw, holder_surname)
 
         if is_plausible_person_name(name):
             return name
 
     # 3. مرساة مكان الولادة (تشتغل بدون أي تسمية)
-    return extract_father_by_place_anchor(printed_text)
+    by_anchor = extract_father_by_place_anchor(printed_text)
+
+    if by_anchor:
+        return by_anchor
+
+    # 4. أي سطر "لقب، أسماء" (لقب الزوج المختلف)
+    return extract_father_by_comma_line(printed_text, holder_surname)
 
 
 # ============================================================================
@@ -1329,18 +1430,20 @@ def calculate_score(is_checksum_ok, fields, l1, l2, surname, given_names):
     if len(l2) == 44:
         score += 1
 
+    # ⚠ عقوبة: أسماء فيها بقايا حشو (مقاطع من حرف واحد) — نفضّل
+    # النسخة اللي أسماؤها نظيفة
+    for name in (surname, given_names):
+        tokens = (name or "").split()
+        junk = sum(1 for t in tokens if len(t) <= 2 and len(set(t)) == 1)
+        score -= junk
+
     return score
 
 
 # ============================================================================
-# ⚠ فحص شكل رقم الجواز
+# فحص شكل رقم الجواز
 # ============================================================================
-# حالة واقعية: رقم "JK5173291" انقرا "JKS473291" — وأرقام التحقق
-# نجحت عليه (لأن السطر الثاني كله انقرا غلط بشكل متسق)، فطلعت
-# القراءة "مؤكدة" برقم غلط بدون أي إشارة.
-#
-# ما نقدر "نصلّحه" برمجياً: أي تعديل يكسر التحقق الرياضي، وما عندنا
-# طريقة نعرف الصح. بس نقدر **ننبّه** الموظف يراجعه بعينه
+
 PASSPORT_PATTERNS = {
     "PAK": re.compile(r"^[A-Z]{2}\d{7}$"),
     "IRQ": re.compile(r"^[A-Z]\d{7,8}$"),
@@ -1371,7 +1474,7 @@ def try_mrz_candidate(l1, l2):
         l1 = clean_ocr_line(l1)[:44].ljust(44, "<")
         l2 = clean_ocr_line(l2)[:44].ljust(44, "<")
 
-        # ⚠ نصلّح الأرقام وحروف الحشو بالسطر الأول قبل أي تحليل.
+        # نصلّح الأرقام وحروف الحشو بالسطر الأول قبل أي تحليل.
         # آمن: كل أرقام التحقق محسوبة من السطر الثاني
         l1 = normalize_mrz_line1(l1)[:44].ljust(44, "<")
 
@@ -1403,12 +1506,10 @@ def try_mrz_candidate(l1, l2):
         birth = format_date(getattr(fields, "birth_date", ""), True)
         expiry = format_date(getattr(fields, "expiry_date", ""), False)
 
-        # ⚠ الجنس — من موقعه المباشر بالسطر الثاني، مو من المكتبة
         sex = extract_sex_from_line2(l2, fields)
 
-        # ⚠ الجوازات باسم واحد: بعض الجوازات الباكستانية ما بيها
-        # فاصل "<<" إطلاقاً (P<PAKFARZANA<<<) — يعني ماكو اسم أول
-        # أصلاً، وهذا **مو خطأ قراءة**
+        # الجوازات باسم واحد: بعض الجوازات الباكستانية ما بيها
+        # فاصل "<<" إطلاقاً (P<PAKFARZANA<<<) — وهذا **مو خطأ قراءة**
         names_are_complete = is_valid_name(surname) and (
             is_valid_name(given_names) or not has_separator
         )
@@ -1638,8 +1739,7 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
 
     deadline = time.monotonic() + MAX_SECONDS
 
-    # ⚠ نحجز آخر ثواني للنص المطبوع (اسم الأب + تاريخ الإصدار).
-    # بدون هالحجز، البحث عن MRZ ياكل كل الوقت وما يبقى شي لهم
+    # نحجز آخر ثواني للنص المطبوع (اسم الأب + تاريخ الإصدار)
     mrz_deadline = deadline - PRINTED_TEXT_BUDGET
 
     def better(candidate):
@@ -1649,7 +1749,7 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
             return True
         return candidate.get("score", 0) > best_data.get("score", 0)
 
-    # المرحلة 1: سريعة — تنجح بأغلب الصور وتخلص خلال ثواني
+    # المرحلة 1: سريعة — تنجح بأغلب الصور
     data = process_image(img_bgr, deadline=mrz_deadline, quick=True)
 
     if better(data):
@@ -1673,8 +1773,7 @@ def read_passport_from_bytes(image_bytes: bytes) -> dict:
         if best_data is not None and best_data.get("is_fully_verified"):
             return _finalize(best_data, best_image, deadline)
 
-    # المرحلة 3: شاملة — للأصلية والمقلوبة فقط.
-    # ما نجرب 90 و270 درجة: الصور بهذا التطبيق دائماً أفقية
+    # المرحلة 3: شاملة — للأصلية والمقلوبة فقط
     for candidate_image in [img_bgr, cv2.rotate(img_bgr, cv2.ROTATE_180)]:
 
         if time.monotonic() > mrz_deadline:
@@ -1719,15 +1818,26 @@ def _scan_printed_text(best_data, printed_text, holder_surname):
         if father:
             best_data["father_name_en"] = father
 
-    # احتياطي الأسماء: لو منطقة القراءة الآلية ما أعطت اسم أول
-    # (يصير لما ما يكون بيها الفاصل <<)، نجيبه من "Given Names"
     printed_surname, printed_given = extract_printed_names(printed_text)
 
+    # احتياطي الأسماء: لو منطقة القراءة الآلية ما أعطت اسم أول
     if not best_data.get("given_name_en") and printed_given:
         best_data["given_name_en"] = printed_given
 
     if not best_data.get("surname_en") and printed_surname:
         best_data["surname_en"] = printed_surname
+
+    # ⚠ مطابقة: الاسم المطبوع أوضح من الـMRZ، فلو الفرق حروف زايدة
+    # بالذيل بس (TASSAWARK ← TASSAWAR) نثق بالمطبوع
+    if printed_given:
+        best_data["given_name_en"] = reconcile_name(
+            best_data.get("given_name_en", ""), printed_given
+        )
+
+    if printed_surname:
+        best_data["surname_en"] = reconcile_name(
+            best_data.get("surname_en", ""), printed_surname
+        )
 
     # حالة خاصة: اللقب والاسم الأول طلعوا نفس الشي من منطقة القراءة
     # الآلية (لأن ماكو فاصل)، والنص المطبوع يفرّقهم
@@ -1750,10 +1860,9 @@ def _finalize(best_data, best_image, deadline):
     انقرا منها اسم أب ولا تاريخ إصدار. انصلح، وخلّينا حقل
     "printed_text_note" يقول شنو صار بالضبط عشان ما يتكرر فشل صامت.
 
-    ⚠ الإضافة الجديدة: نقرا لحد 6 نصوص (منطقتين × 3 إعدادات)،
-    ونوقف فوراً أول ما نلقى الحقلين. ولو ما لقينا شي إطلاقاً، نجرب
-    الصورة مقلوبة 180° — أحياناً أفضل نتيجة MRZ تجي من نسخة مقلوبة،
-    وقتها "أعلى الصورة" يكون فعلياً أسفل الجواز وماكو بيه تسميات
+    ⚠ تغيير مهم: صرنا نكمل القراءات حتى لو لقينا حقل واحد — لأن
+    القراءة الأولى ممكن تعطي اسم أب غلط (تسمية منقرية) والثانية
+    تعطي الصح. نوقف بس لما نلقى **الاثنين**
     """
 
     best_data["printed_text_note"] = ""
@@ -1769,11 +1878,15 @@ def _finalize(best_data, best_image, deadline):
         else:
             holder_surname = best_data.get("surname_en", "")
             reads = 0
+            done = False
 
             # نجرب الصورة كما هي، وبعدها مقلوبة لو ما نجحنا
             images = [best_image, cv2.rotate(best_image, cv2.ROTATE_180)]
 
             for image in images:
+
+                if done:
+                    break
 
                 for printed_text in iter_printed_texts(image, deadline=deadline):
 
@@ -1783,13 +1896,12 @@ def _finalize(best_data, best_image, deadline):
 
                     # لقينا الاثنين؟ خلاص، ما نضيع وقت
                     if best_data.get("father_name_en") and best_data.get("issue_date"):
+                        done = True
                         break
 
                     if time.monotonic() > deadline - 1:
+                        done = True
                         break
-
-                if best_data.get("father_name_en") or best_data.get("issue_date"):
-                    break
 
                 if time.monotonic() > deadline - 3:
                     break
@@ -1810,9 +1922,20 @@ def _finalize(best_data, best_image, deadline):
                 )
 
     except Exception as error:
-        # ⚠ ما نبلع الخطأ بصمت — نسجّله بالنتيجة
+        # ما نبلع الخطأ بصمت — نسجّله بالنتيجة
         best_data["printed_text_note"] = (
             f"فشل النص المطبوع: {type(error).__name__}: {error}"
+        )
+
+    # ⚠ حارس أخير على اسم الأب: لو طلعت تسمية منقرية غلط
+    # ("DSTE OF EPRY")، نمسحها بدل ما نرسلها للتطبيق
+    father = best_data.get("father_name_en", "")
+    if father and not is_plausible_person_name(father):
+        best_data["father_name_en"] = ""
+        note = best_data.get("printed_text_note", "")
+        best_data["printed_text_note"] = (
+            (note + " · " if note and note != "تمام" else "")
+            + "اسم الأب انرفض (تسمية مو قيمة)"
         )
 
     # فحص أخير: ما نطلّع أي "None" للتطبيق
@@ -1826,6 +1949,7 @@ def _finalize(best_data, best_image, deadline):
     # حزام أمان أخير على الأسماء: أي بقايا حشو ذيلية تنشال
     best_data["given_name_en"] = trim_filler_tokens(best_data["given_name_en"])
     best_data["surname_en"] = trim_filler_tokens(best_data["surname_en"])
+    best_data["father_name_en"] = trim_filler_tokens(best_data["father_name_en"])
 
     return best_data
 
