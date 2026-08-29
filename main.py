@@ -454,8 +454,11 @@ def trim_filler_tokens(name: str) -> str:
 
         # مقطع كله نفس الحرف
         if len(set(last)) == 1:
-            # حرف واحد مكرر: نشيله لو حرف حشو، أو لو أطول من حرفين
-            if last[0] in FILLER_LETTERS or len(last) >= 3:
+            # ⚠ حرف واحد لحاله بالذيل = خردة دايماً، بغض النظر عن
+            # الحرف. هذا الشرط ناقص كان يمنع حالة "TASSAWARK SE S"
+            # من الانصلاح فعلياً — "S" مو بحروف الحشو (X/K/G)
+            # فالحلقة كانت توقف بأول مقطع ولا تشيل شي إطلاقاً
+            if last[0] in FILLER_LETTERS or len(last) >= 3 or len(last) == 1:
                 tokens.pop()
                 removed_any = True
                 continue
@@ -560,6 +563,22 @@ def is_plausible_person_name(name: str) -> bool:
         label_count = sum(1 for w in words if looks_like_label_word(w))
         if label_count * 2 >= len(words):
             return False
+
+    # ⚠ 19. مقاطع خردة من تداخل عمودين متجاورين بصفحة البيانات
+    # (مثلاً عمود "الجنسية/محل الإقامة" يندمج مع عمود "محل
+    # الولادة" بنفس السطر). حالة واقعية: "PAK IE I AA F KHAIRPUR"
+    # طلعت كاسم أب — لا اسم بشر حقيقي فيه مقطع من حرف واحد لحاله
+    # ("I"، "F")، ولا فيه مقطعين أو أكثر من حرف/حرفين
+    if any(len(w) == 1 for w in words):
+        return False
+
+    if sum(1 for w in words if len(w) <= 2) >= 2:
+        return False
+
+    # ⚠ رمز دولة كمقطع مستقل (مو الكلمة كلها) — نفس منطق مطابقة
+    # الدولة الكاملة أعلاه، بس على مستوى الكلمة المفردة
+    if any(w in COUNTRY_NAMES for w in words):
+        return False
 
     return is_valid_name(clean)
 
@@ -918,6 +937,121 @@ def _prepare_printed_region(img_bgr, top_ratio):
     return clahe.apply(gray)
 
 
+def _split_words_into_columns(words):
+    """
+    ⚠ جديد: نقسم كلمات المنطقة لعمود وحد أو عمودين، حسب الإحداثي
+    الأفقي — بدل ما نعتمد على ترتيب الأسطر اللي يقرره Tesseract
+    نفسه (وهذا بالضبط سبب حالة "PAK IE I AA F KHAIRPUR": عمود
+    الجنسية اندمج مع عمود محل الولادة بنفس السطر لأن الصفين ما
+    كانا بنفس الارتفاع بالضبط).
+
+    الفكرة: نلقى أكبر فجوة أفقية بمنتصف الصفحة (25%-75% من العرض).
+    فجوة حقيقية بين عمودين تكون أوسع بكثير من مجرد مسافة بين
+    كلمتين بنفس السطر. لو ما لقينا فجوة واضحة، نرجع عمود وحد
+    (يعني الصفحة أصلاً عمود وحد ومو داعي نقسمها).
+    """
+
+    if not words:
+        return [words]
+
+    page_left = min(w["left"] for w in words)
+    page_right = max(w["left"] + w["width"] for w in words)
+    page_width = page_right - page_left
+
+    if page_width <= 0:
+        return [words]
+
+    xs = sorted(w["left"] for w in words)
+
+    best_gap = 0
+    split_x = None
+
+    for i in range(1, len(xs)):
+        gap = xs[i] - xs[i - 1]
+        mid = (xs[i] + xs[i - 1]) / 2
+        rel = (mid - page_left) / page_width
+        if 0.25 <= rel <= 0.75 and gap > best_gap:
+            best_gap = gap
+            split_x = mid
+
+    min_gap = page_width * 0.06
+
+    if split_x is None or best_gap < min_gap:
+        return [words]
+
+    left_col = [w for w in words if w["left"] < split_x]
+    right_col = [w for w in words if w["left"] >= split_x]
+
+    # عمود فيه كلمتين أو أقل مو عمود حقيقي (احتمال ضجيج)
+    if len(left_col) < 3 or len(right_col) < 3:
+        return [words]
+
+    return [left_col, right_col]
+
+
+def _words_to_text_lines(words):
+    """
+    نرتب كلمات عمود واحد لسطور حسب تقارب الإحداثي العمودي (بدل
+    الاعتماد على رقم السطر اللي يعطيه Tesseract، لأنه محسوب على
+    كامل عرض المنطقة مو على العمود لحاله).
+    """
+
+    if not words:
+        return []
+
+    ws = sorted(words, key=lambda w: w["top"])
+
+    lines = [[ws[0]]]
+    line_top = ws[0]["top"]
+    line_height = ws[0]["height"] or 20
+
+    for w in ws[1:]:
+        tolerance = max(line_height, w["height"] or 20) * 0.6
+        if abs(w["top"] - line_top) <= tolerance:
+            lines[-1].append(w)
+            line_top = min(line_top, w["top"])
+        else:
+            lines.append([w])
+            line_top = w["top"]
+            line_height = w["height"] or 20
+
+    text_lines = []
+    for line in lines:
+        line_sorted = sorted(line, key=lambda w: w["left"])
+        text = " ".join(w["text"] for w in line_sorted if w["text"].strip())
+        if text.strip():
+            text_lines.append(text)
+
+    return text_lines
+
+
+def _extract_words_from_data(data, min_conf=35):
+    """نحوّل خرج pytesseract.image_to_data لقائمة كلمات نظيفة."""
+
+    words = []
+    n = len(data.get("text", []))
+
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1
+        if conf < min_conf:
+            continue
+        words.append({
+            "text": text,
+            "left": data["left"][i],
+            "top": data["top"][i],
+            "width": data["width"][i],
+            "height": data["height"][i],
+        })
+
+    return words
+
+
 def iter_printed_texts(img_bgr, deadline=None):
     """
     مولّد يرجّع نصوص النص المطبوع **وحدة وحدة**.
@@ -926,6 +1060,14 @@ def iter_printed_texts(img_bgr, deadline=None):
     والقيمة بالسطر اللي بعده". لو لصقنا نصين، آخر سطر بالقراءة
     الأولى يصير جار أول سطر بالقراءة الثانية — وهما من مكانين
     مختلفين تماماً بالصورة
+
+    ⚠ جديد: قبل ما نبني النص، نقرا الكلمات بإحداثياتها
+    (image_to_data) ونقسمها لعمود أو عمودين بالموقع الأفقي الفعلي،
+    بدل ما نثق بترتيب الأسطر اللي يقرره Tesseract على عرض الصفحة
+    كامل. هذا يمنع تداخل عمودين متجاورين بسطر وحد من الأساس —
+    بدل ما نصيد الخردة الناتجة بعدين بفحوصات is_plausible_person_name.
+    نرجّع النص القديم (image_to_string) كمان كخط رجعة أخير، لأن
+    بعض الصور عمود وحد فعلاً وما تحتاج كل هذا
     """
 
     for top_ratio in (0.78, 1.0):
@@ -943,6 +1085,31 @@ def iter_printed_texts(img_bgr, deadline=None):
             if deadline is not None and time.monotonic() > deadline:
                 return
 
+            # ------------------------------------------------------
+            # 1. الطريقة الجديدة: كلمات بإحداثياتها → أعمدة → سطور
+            # ------------------------------------------------------
+            try:
+                data = pytesseract.image_to_data(
+                    prepared, config=config, lang="eng",
+                    output_type=pytesseract.Output.DICT,
+                )
+                words = _extract_words_from_data(data)
+                columns = _split_words_into_columns(words)
+
+                for column_words in columns:
+                    lines = _words_to_text_lines(column_words)
+                    if lines:
+                        yield "\n".join(lines)
+
+            except Exception:
+                pass
+
+            if deadline is not None and time.monotonic() > deadline:
+                return
+
+            # ------------------------------------------------------
+            # 2. خط رجعة أخير: النص الخام القديم (image_to_string)
+            # ------------------------------------------------------
             try:
                 text = pytesseract.image_to_string(
                     prepared, config=config, lang="eng"
@@ -1950,6 +2117,34 @@ def _finalize(best_data, best_image, deadline):
     best_data["given_name_en"] = trim_filler_tokens(best_data["given_name_en"])
     best_data["surname_en"] = trim_filler_tokens(best_data["surname_en"])
     best_data["father_name_en"] = trim_filler_tokens(best_data["father_name_en"])
+
+    # ========================================================================
+    # ⚠ 20. حقول جديدة فقط — ما نلمس ولا نحذف أي حقل موجود، فما
+    # يتعارض مع أي Parsing موجود بتطبيق Flutter. الفكرة: بيانات
+    # الـMRZ (الاسم، رقم الجواز، الميلاد، الانتهاء، الجنسية) مؤكدة
+    # رياضياً برقم تحقق checksum — ما فيها مجال غلط عملياً. بيانات
+    # النص المطبوع (اسم الأب، تاريخ الإصدار) ماكو لها أي رقم تحقق
+    # بمعيار الجواز، فمستحيل تكون مؤكدة 100% مهما قوينا القراءة —
+    # هذا حد فيزيائي مو تقصير كود. `needs_review` تعلّم أي حقل
+    # يستاهل عين بشر قبل الاعتماد، بدل ما نطارد "0% غلط" ماكو ممكن
+    # ========================================================================
+
+    best_data["needs_review"] = bool(
+        not best_data.get("father_name_en")
+        or not best_data.get("issue_date")
+    )
+
+    best_data["fields_confidence"] = {
+        "given_name_en": "verified" if best_data.get("is_verified") else "unverified",
+        "surname_en": "verified" if best_data.get("is_verified") else "unverified",
+        "passport_number": "verified" if best_data.get("is_verified") else "unverified",
+        "birth_date": "verified" if best_data.get("is_verified") else "unverified",
+        "expiry_date": "verified" if best_data.get("is_verified") else "unverified",
+        "nationality": "verified" if best_data.get("is_verified") else "unverified",
+        # ماكو رقم تحقق لهذولا بمعيار الجواز إطلاقاً — دايماً "غير مؤكد"
+        "father_name_en": "unverified",
+        "issue_date": "unverified",
+    }
 
     return best_data
 
