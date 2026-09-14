@@ -1,6 +1,6 @@
 """
 FastAPI passport OCR service.
-v5: the Flutter app detects labels/crops locally and sends only field crops.
+v6: نسخة تشخيص — تضيف نقطة GET /debug-read لقياس ما يقرأه OCR فعلياً.
 
 تغييرات v5 مقابل v4 (إصلاحان فقط، بقية الملف كما هو):
   1. _ocr_crop      — كان يحتفظ بأقصر نتيجة OCR، فيضيّع الأسماء.
@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from mrz.checker.td3 import TD3CodeChecker
 
 app = FastAPI(title="Passport Reader API")
-SERVER_VERSION = "cloud-app-crop-v5"
+SERVER_VERSION = "cloud-app-crop-v6-debug"
 
 MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 MONTH_INDEX = {m: i + 1 for i, m in enumerate(MONTHS)}
@@ -524,3 +524,88 @@ async def read_passport(file: UploadFile = File(...)):
     for k in ("given_name_en","surname_en","passport_number","nationality","residence_country","birth_date","expiry_date","sex"):
         if best.get(k): best["field_sources"][k] = "mrz"
     return JSONResponse(content=best)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 🔬 نقطة تشخيص مؤقتة — احذفها بعد ما نخلّص
+# ══════════════════════════════════════════════════════════════════════
+# تنزّل صورة جواز من رابط عام وتشغّل عليها نفس مسار MRZ، وترجّع
+# نص OCR الخام. الهدف: نشوف بأم العين شنو يقرأه Tesseract بدل ما
+# نخمّن. مقيّدة بمضيف Supabase حقك فقط حتى ما تنفتح كبوابة تنزيل.
+#
+#   GET /debug-read?url=https://hifkuvyvhrxmcgkbvgqo.supabase.co/...jpg
+# ══════════════════════════════════════════════════════════════════════
+
+import urllib.request
+from urllib.parse import urlparse
+
+ALLOWED_IMAGE_HOST = "hifkuvyvhrxmcgkbvgqo.supabase.co"
+
+
+def _debug_region(color, y_from: float, y_to: float, label: str):
+    """يقص منطقة عمودية من الصورة ويرجّع قراءة MRZ منها."""
+    hh, ww = color.shape[:2]
+    crop = color[int(hh * y_from):int(hh * y_to), 0:ww]
+    ok, enc = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 94])
+    if not ok:
+        return {"region": label, "error": "تعذر الترميز"}
+    r, raw = _mrz_from_bytes(enc.tobytes())
+    out = {
+        "region": label,
+        "crop_size": [crop.shape[1], crop.shape[0]],
+        "raw_ocr": re.sub(r"\s+", " ", raw)[:600],
+    }
+    if r:
+        out["parsed"] = {
+            k: r.get(k) for k in (
+                "surname_en", "given_name_en", "passport_number",
+                "nationality", "residence_country", "birth_date",
+                "expiry_date", "sex", "is_verified", "score",
+                "mrz_line1", "mrz_line2",
+            )
+        }
+    else:
+        out["parsed"] = None
+    return out
+
+
+@app.get("/debug-read")
+def debug_read(url: str = ""):
+    if not url:
+        return JSONResponse(status_code=400, content={"error": "مرر ?url=..."})
+
+    host = urlparse(url).netloc
+    if host != ALLOWED_IMAGE_HOST:
+        return JSONResponse(
+            status_code=403,
+            content={"error": f"مضيف غير مسموح: {host}"},
+        )
+
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            b = resp.read()
+    except Exception as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"تعذر تنزيل الصورة: {e}"},
+        )
+
+    out = {"server_version": SERVER_VERSION, "bytes": len(b)}
+
+    color = _decode(b, gray=False)
+    if color is None:
+        out["error"] = "تعذر فك ترميز الصورة"
+        return JSONResponse(content=out)
+
+    hh, ww = color.shape[:2]
+    out["image_size"] = [ww, hh]
+    out["tesseract"] = str(pytesseract.get_tesseract_version())
+
+    # نجرّب ثلاث مناطق: نفس ما يستخدمه /read-passport، ونفس احتياط
+    # التطبيق (آخر 31%)، وشريحة أضيق على الـMRZ
+    out["regions"] = [
+        _debug_region(color, 0.55, 1.00, "bottom_45%  (مسار /read-passport)"),
+        _debug_region(color, 0.69, 1.00, "bottom_31%  (احتياط التطبيق)"),
+        _debug_region(color, 0.78, 1.00, "bottom_22%  (شريحة ضيّقة)"),
+    ]
+    return JSONResponse(content=out)
