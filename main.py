@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from mrz.checker.td3 import TD3CodeChecker
 
 app = FastAPI(title="Passport Reader API")
-SERVER_VERSION = "cloud-app-crop-v6-debug"
+SERVER_VERSION = "cloud-app-crop-v7"
 
 MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 MONTH_INDEX = {m: i + 1 for i, m in enumerate(MONTHS)}
@@ -263,9 +263,41 @@ def _mrz_names(l1):
     giv = _clean_name(parts[1].replace("<"," ")) if len(parts) > 1 else ""
     return sur, giv
 
+_MONTH_ABBR = set(MONTHS) | {"SEPT"}
+
+def _looks_like_td3(l1, l2):
+    """
+    🔴 الإصلاح الثالث — الأهم.
+    قبل كان _try_mrz يبلع أي سطرين طولهما 30+ حرفاً ويسلّمهما لـ
+    TD3CodeChecker. فلو التقط OCR سطر تاريخ مطبوع مثل "12 AUG 1964"
+    صار l1[2:5] = "AUG" ويُعتبر رمز دولة، فتطلع الجنسية "AUG" وبلد
+    الإقامة "AUG" — وهذا اللي ظهر بالتطبيق فعلاً.
+    الحين نتحقق أن السطرين يطابقان بنية TD3 قبل الوثوق بهما.
+    """
+    if not re.match(r"^[A-Z][A-Z<]", l1):
+        return False
+    code = l1[2:5]
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        return False
+    if code in _MONTH_ABBR:          # "AUG" / "MAY" ليست دولاً
+        return False
+    if "<<" not in l1[5:]:           # الفاصل بين اللقب والاسم إلزامي
+        return False
+    if not re.fullmatch(r"[A-Z]{3}", l2[10:13]):
+        return False
+    if not re.fullmatch(r"[0-9]{6}", l2[13:19]):
+        return False
+    if l2[20] not in "MF<":
+        return False
+    if not re.fullmatch(r"[0-9]{6}", l2[21:27]):
+        return False
+    return True
+
 def _try_mrz(l1, l2):
     l1 = _clean_mrz_line(l1)[:44].ljust(44, "<")
     l2 = _clean_mrz_line(l2)[:44].ljust(44, "<")
+    if not _looks_like_td3(l1, l2):
+        return None
     try:
         checker = TD3CodeChecker(f"{l1}\n{l2}", check_expiry=False)
         f = checker.fields()
@@ -569,29 +601,34 @@ def _debug_region(color, y_from: float, y_to: float, label: str):
     return out
 
 
-@app.get("/debug-read")
-def debug_read(url: str = ""):
-    if not url:
-        return JSONResponse(status_code=400, content={"error": "مرر ?url=..."})
+@app.get("/debug/{file_name}")
+def debug_read(file_name: str):
+    """
+    تشخيص: تنزّل صورة جواز من مخزن Supabase وتشغّل مسار MRZ على ثلاث
+    مناطق، وترجّع نص OCR الخام. ترجع 200 دائماً حتى نقرأ سبب أي فشل.
+    مثال:  /debug/1787927303912-2.jpg
+    """
+    out = {"server_version": SERVER_VERSION, "file": file_name}
 
-    host = urlparse(url).netloc
-    if host != ALLOWED_IMAGE_HOST:
-        return JSONResponse(
-            status_code=403,
-            content={"error": f"مضيف غير مسموح: {host}"},
-        )
+    if "/" in file_name or ".." in file_name:
+        out["error"] = "اسم ملف غير صالح"
+        return JSONResponse(content=out)
+
+    url = (
+        f"https://{ALLOWED_IMAGE_HOST}"
+        f"/storage/v1/object/public/passport-files/{file_name}"
+    )
+    out["url"] = url
 
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        req = urllib.request.Request(url, headers={"User-Agent": "passport-reader-debug/1.0"})
+        with urllib.request.urlopen(req, timeout=40) as resp:
             b = resp.read()
     except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"تعذر تنزيل الصورة: {e}"},
-        )
+        out["error"] = f"تعذر التنزيل: {type(e).__name__}: {e}"
+        return JSONResponse(content=out)
 
-    out = {"server_version": SERVER_VERSION, "bytes": len(b)}
-
+    out["bytes"] = len(b)
     color = _decode(b, gray=False)
     if color is None:
         out["error"] = "تعذر فك ترميز الصورة"
@@ -599,13 +636,14 @@ def debug_read(url: str = ""):
 
     hh, ww = color.shape[:2]
     out["image_size"] = [ww, hh]
-    out["tesseract"] = str(pytesseract.get_tesseract_version())
+    try:
+        out["tesseract"] = str(pytesseract.get_tesseract_version())
+    except Exception as e:
+        out["tesseract"] = f"غير متاح: {e}"
 
-    # نجرّب ثلاث مناطق: نفس ما يستخدمه /read-passport، ونفس احتياط
-    # التطبيق (آخر 31%)، وشريحة أضيق على الـMRZ
     out["regions"] = [
-        _debug_region(color, 0.55, 1.00, "bottom_45%  (مسار /read-passport)"),
-        _debug_region(color, 0.69, 1.00, "bottom_31%  (احتياط التطبيق)"),
-        _debug_region(color, 0.78, 1.00, "bottom_22%  (شريحة ضيّقة)"),
+        _debug_region(color, 0.55, 1.00, "bottom_45"),
+        _debug_region(color, 0.69, 1.00, "bottom_31"),
+        _debug_region(color, 0.80, 1.00, "bottom_20"),
     ]
     return JSONResponse(content=out)
