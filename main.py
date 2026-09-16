@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from mrz.checker.td3 import TD3CodeChecker
 
 app = FastAPI(title="Passport Reader API")
-SERVER_VERSION = "cloud-app-crop-v13"
+SERVER_VERSION = "cloud-app-crop-v14"
 logger = logging.getLogger(__name__)
 
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
