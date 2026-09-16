@@ -154,11 +154,20 @@ def _clean_name(text):
     return re.sub(r"\s+", " ", s).strip()
 
 
+_NAME_NOISE_LETTERS = {"K", "X", "S", "G", "N", "F", "P"}
+
+
 def _plausible_name(name):
     if not name or len(name) < 2 or not re.fullmatch(r"[A-Z ]{2,60}", name):
         return False
     words = name.split()
-    if not words or any(len(w) == 1 for w in words):
+    if not words:
+        return False
+    # Only single letters known to come from OCR noise (MRZ '<' filler
+    # misread as K/X/S, or stray printed-label remnants like GIVEN NAME ->
+    # G N) are rejected. A real single-letter middle initial (e.g. "SHUHDA
+    # E FATIMA") is common on South Asian passports and must survive.
+    if any(len(w) == 1 and w in _NAME_NOISE_LETTERS for w in words):
         return False
     if sum(1 for w in words if w in LABEL_WORDS) >= max(1, len(words) // 2):
         return False
