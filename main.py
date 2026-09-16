@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from mrz.checker.td3 import TD3CodeChecker
 
 app = FastAPI(title="Passport Reader API")
-SERVER_VERSION = "cloud-app-crop-v15"
+SERVER_VERSION = "cloud-app-crop-v16"
 logger = logging.getLogger(__name__)
 
 # The host this runs on (free-tier, single shared vCPU) can only run one
@@ -120,7 +120,7 @@ def _field_variants(gray, width=900):
     _, strong_otsu = cv2.threshold(strong, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return [img, sharp, otsu, strong_otsu, medium_strong_otsu]
 
-def _ocr(img, whitelist, psm=7, timeout=6):
+def _ocr(img, whitelist, psm=7, timeout=12):
     if img is None:
         return ""
     cfg = (
@@ -386,7 +386,7 @@ def _ocr_crop(data: bytes, kind: str):
         band = _value_band(gray, kind)
 
         first_psm = 7 if kind in {"given", "surname"} else 6
-        first = _ocr(_quick_variant(band, 1000), wl, psm=first_psm, timeout=4)
+        first = _ocr(_quick_variant(band, 1000), wl, psm=first_psm, timeout=12)
         first_clean = _strip_name_noise_tokens(_strip_label(first, kind))
         if _plausible_name(first_clean):
             return first_clean
@@ -395,7 +395,7 @@ def _ocr_crop(data: bytes, kind: str):
             _quick_variant(band, 1100, clahe=True),
             wl,
             psm=11 if kind == "father" else 7,
-            timeout=4,
+            timeout=12,
         )
         second_clean = _strip_name_noise_tokens(_strip_label(second, kind))
         if _plausible_name(second_clean):
@@ -406,25 +406,25 @@ def _ocr_crop(data: bytes, kind: str):
     if kind in {"birth", "issue", "expiry"}:
         wl = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-/."
         # Full crop first: on clear scans it keeps enough context for Tesseract.
-        first = _ocr(_quick_variant(gray, 900), wl, psm=11, timeout=4)
+        first = _ocr(_quick_variant(gray, 900), wl, psm=11, timeout=12)
         if _find_dates(_strip_label(first, kind)):
             return first
 
         # Faint green Pakistani scans improve strongly with local contrast.
-        second = _ocr(_quick_variant(gray, 900, clahe=True), wl, psm=11, timeout=4)
+        second = _ocr(_quick_variant(gray, 900, clahe=True), wl, psm=11, timeout=12)
         if _find_dates(_strip_label(second, kind)):
             return second
 
         # Last date-only fallback: remove the lower neighbouring field/noise.
         top = gray[:max(4, int(gray.shape[0] * 0.78)), :]
-        third = _ocr(_quick_variant(top, 900, otsu=True), wl, psm=11, timeout=4)
+        third = _ocr(_quick_variant(top, 900, otsu=True), wl, psm=11, timeout=12)
         return third or second or first
 
     if kind == "passport":
         wl = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
         band = _value_band(gray, kind)
 
-        first = _ocr(_quick_variant(band, 1000), wl, psm=7, timeout=4)
+        first = _ocr(_quick_variant(band, 1000), wl, psm=7, timeout=12)
         flat = re.sub(r"[^A-Z0-9]", "", first.upper())
         if re.fullmatch(r"[A-Z0-9]{6,12}", flat) and any(ch.isdigit() for ch in flat):
             return flat
@@ -433,7 +433,7 @@ def _ocr_crop(data: bytes, kind: str):
             _quick_variant(band, 1200, clahe=True),
             wl,
             psm=7,
-            timeout=4,
+            timeout=12,
         )
         flat2 = re.sub(r"[^A-Z0-9]", "", second.upper())
         if re.fullmatch(r"[A-Z0-9]{6,12}", flat2) and any(ch.isdigit() for ch in flat2):
@@ -443,12 +443,12 @@ def _ocr_crop(data: bytes, kind: str):
     if kind == "nationality":
         wl = "ABCDEFGHIJKLMNOPQRSTUVWXYZ "
         band = _value_band(gray, kind)
-        return _ocr(_quick_variant(band, 800), wl, psm=11, timeout=4)
+        return _ocr(_quick_variant(band, 800), wl, psm=11, timeout=12)
 
     if kind == "sex":
         wl = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         band = _value_band(gray, kind)
-        return _ocr(_quick_variant(band, 500), wl, psm=11, timeout=3)
+        return _ocr(_quick_variant(band, 500), wl, psm=11, timeout=10)
 
     return ""
 
@@ -717,7 +717,7 @@ def _mrz_from_bytes(data: bytes):
         cfg = f"--oem 1 --psm {psm} -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
         try:
             text = pytesseract.image_to_string(
-                image_variant, config=cfg, lang="eng", timeout=6
+                image_variant, config=cfg, lang="eng", timeout=12
             )
         except Exception as exc:
             logger.warning("MRZ OCR failed (%s)", type(exc).__name__)
