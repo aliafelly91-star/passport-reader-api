@@ -21,8 +21,19 @@ from fastapi.responses import JSONResponse
 from mrz.checker.td3 import TD3CodeChecker
 
 app = FastAPI(title="Passport Reader API")
-SERVER_VERSION = "cloud-app-crop-v14"
+SERVER_VERSION = "cloud-app-crop-v15"
 logger = logging.getLogger(__name__)
+
+# The host this runs on (free-tier, single shared vCPU) can only run one
+# tesseract subprocess at a time without every concurrent call starving
+# the others into timing out. Cap OCR concurrency server-wide instead of
+# letting a single request's crops (or two overlapping requests) pile up.
+_OCR_CONCURRENCY = asyncio.Semaphore(1)
+
+
+async def _run_ocr_job(func, *args):
+    async with _OCR_CONCURRENCY:
+        return await run_in_threadpool(func, *args)
 
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 MONTH_INDEX = {m: i + 1 for i, m in enumerate(MONTHS)}
@@ -816,17 +827,18 @@ async def read_passport_fields(
     src = result["field_sources"]
     debug = {}
 
-    # Every crop is independent OCR work. Running MRZ (up to ~12s) and each
-    # of the up to 9 field crops (up to ~6s apiece) one after another can
-    # add up past a minute, which used to blow past Flutter's own request
-    # timeout and come back with only whichever fields finished in time —
-    # explaining reads that lose fields (or the event loop staying blocked
-    # long enough that a second request queued behind it looks stuck).
-    # Running them concurrently instead bounds total latency by the single
-    # slowest crop, not their sum, and frees the event loop between them.
+    # Every crop is independent OCR work, so it's tempting to run all of it
+    # concurrently. That backfired on this host: a single free-tier/shared
+    # vCPU instance can only actually run one tesseract subprocess at a
+    # time, so firing off the MRZ crop plus up to 9 field crops at once just
+    # made every one of them starve the others until each hit its own
+    # timeout (RuntimeError) — turning normal, readable passports into
+    # total 422s. _run_ocr_job serializes the actual OCR work through a
+    # semaphore while still keeping it off the event loop via a thread, so
+    # the server can accept other requests without oversubscribing the CPU.
     jobs = {}
     if data.get("mrz_crop"):
-        jobs["mrz_crop"] = run_in_threadpool(_mrz_from_bytes, data["mrz_crop"])
+        jobs["mrz_crop"] = _run_ocr_job(_mrz_from_bytes, data["mrz_crop"])
     for field, kind in (
         ("given_name_crop", "given"),
         ("surname_crop", "surname"),
@@ -839,7 +851,7 @@ async def read_passport_fields(
         ("nationality_crop", "nationality"),
     ):
         if data.get(field):
-            jobs[field] = run_in_threadpool(_ocr_crop, data[field], kind)
+            jobs[field] = _run_ocr_job(_ocr_crop, data[field], kind)
     job_results = dict(zip(jobs.keys(), await asyncio.gather(*jobs.values())))
 
     # MRZ first: one successful pass gives passport/date/nationality/sex quickly.
