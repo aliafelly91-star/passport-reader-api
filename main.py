@@ -438,11 +438,19 @@ def _clean_mrz_line(line):
 
 
 def _mrz_names(l1):
+    """Decode the TD3 name field with the same filler-noise handling as the
+    fuzzy parser. A checksum-valid MRZ says nothing about the name field (it
+    isn't check-digited), so misread '<' filler still needs to be stripped
+    here instead of passed straight through as a 'verified' name.
+    """
     body = l1[5:44].rstrip("<")
     parts = body.split("<<", 1)
-    sur = _clean_name(parts[0].replace("<", " "))
-    given_block = parts[1].split("<<", 1)[0] if len(parts) > 1 else ""
-    giv = _clean_name(given_block.replace("<", " "))
+    sur = _mrz_name_block(parts[0])
+    giv = _mrz_name_block(parts[1]) if len(parts) > 1 else ""
+    if not _plausible_name(sur):
+        sur = ""
+    if not _plausible_name(giv):
+        giv = ""
     return sur, giv
 
 
