@@ -5,6 +5,7 @@ printed field locally, then Python reads the small value crops. MRZ is used for
 structural fields and as a cross-check, not as the only name source.
 """
 
+import asyncio
 import logging
 import re
 import time
@@ -15,6 +16,7 @@ import cv2
 import numpy as np
 import pytesseract
 from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from mrz.checker.td3 import TD3CodeChecker
 
@@ -438,11 +440,19 @@ def _clean_mrz_line(line):
 
 
 def _mrz_names(l1):
+    """Decode the TD3 name field with the same filler-noise handling as the
+    fuzzy parser. A checksum-valid MRZ says nothing about the name field (it
+    isn't check-digited), so misread '<' filler still needs to be stripped
+    here instead of passed straight through as a 'verified' name.
+    """
     body = l1[5:44].rstrip("<")
     parts = body.split("<<", 1)
-    sur = _clean_name(parts[0].replace("<", " "))
-    given_block = parts[1].split("<<", 1)[0] if len(parts) > 1 else ""
-    giv = _clean_name(given_block.replace("<", " "))
+    sur = _mrz_name_block(parts[0])
+    giv = _mrz_name_block(parts[1]) if len(parts) > 1 else ""
+    if not _plausible_name(sur):
+        sur = ""
+    if not _plausible_name(giv):
+        giv = ""
     return sur, giv
 
 
@@ -797,9 +807,35 @@ async def read_passport_fields(
     src = result["field_sources"]
     debug = {}
 
-    # MRZ first: one successful pass gives passport/date/nationality/sex quickly.
+    # Every crop is independent OCR work. Running MRZ (up to ~12s) and each
+    # of the up to 9 field crops (up to ~6s apiece) one after another can
+    # add up past a minute, which used to blow past Flutter's own request
+    # timeout and come back with only whichever fields finished in time —
+    # explaining reads that lose fields (or the event loop staying blocked
+    # long enough that a second request queued behind it looks stuck).
+    # Running them concurrently instead bounds total latency by the single
+    # slowest crop, not their sum, and frees the event loop between them.
+    jobs = {}
     if data.get("mrz_crop"):
-        mrz, raw = _mrz_from_bytes(data["mrz_crop"])
+        jobs["mrz_crop"] = run_in_threadpool(_mrz_from_bytes, data["mrz_crop"])
+    for field, kind in (
+        ("given_name_crop", "given"),
+        ("surname_crop", "surname"),
+        ("father_name_crop", "father"),
+        ("issue_date_crop", "issue"),
+        ("birth_date_crop", "birth"),
+        ("expiry_date_crop", "expiry"),
+        ("passport_number_crop", "passport"),
+        ("sex_crop", "sex"),
+        ("nationality_crop", "nationality"),
+    ):
+        if data.get(field):
+            jobs[field] = run_in_threadpool(_ocr_crop, data[field], kind)
+    job_results = dict(zip(jobs.keys(), await asyncio.gather(*jobs.values())))
+
+    # MRZ first: one successful pass gives passport/date/nationality/sex quickly.
+    if "mrz_crop" in job_results:
+        mrz, raw = job_results["mrz_crop"]
         if raw:
             debug["mrz_crop"] = re.sub(r"\s+", " ", raw)[:350]
         if mrz:
@@ -818,9 +854,9 @@ async def read_passport_fields(
         ("surname_crop", "surname", "surname_en"),
         ("father_name_crop", "father", "father_name_en"),
     ):
-        if not data.get(field):
+        if field not in job_results:
             continue
-        raw = _strip_label(_ocr_crop(data[field], kind), kind)
+        raw = _strip_label(job_results[field], kind)
         if raw:
             debug[field] = raw[:140]
         val = _clean_name(raw)
@@ -846,12 +882,12 @@ async def read_passport_fields(
         ("birth_date_crop", "birth", "birth_date"),
         ("expiry_date_crop", "expiry", "expiry_date"),
     ):
-        if not data.get(field):
+        if field not in job_results:
             continue
         # Issue date is absent from TD3. Birth/expiry use crop only if MRZ missed.
         if outkey != "issue_date" and result.get(outkey):
             continue
-        raw = _strip_label(_ocr_crop(data[field], kind), kind)
+        raw = _strip_label(job_results[field], kind)
         if raw:
             debug[field] = raw[:120]
         dates = _find_dates(raw)
@@ -859,8 +895,8 @@ async def read_passport_fields(
             result[outkey] = _date_text(dates[0])
             src[outkey] = "app_crop"
 
-    if data.get("passport_number_crop") and not result.get("passport_number"):
-        raw = _strip_label(_ocr_crop(data["passport_number_crop"], "passport"), "passport")
+    if "passport_number_crop" in job_results and not result.get("passport_number"):
+        raw = _strip_label(job_results["passport_number_crop"], "passport")
         if raw:
             debug["passport_number_crop"] = raw[:100]
         flat = re.sub(r"[^A-Z0-9]", "", raw.upper())
@@ -870,8 +906,8 @@ async def read_passport_fields(
             result["passport_number"] = min(tokens, key=lambda x: abs(len(x) - 9))
             src["passport_number"] = "app_crop"
 
-    if data.get("sex_crop") and not result.get("sex"):
-        raw = _strip_label(_ocr_crop(data["sex_crop"], "sex"), "sex")
+    if "sex_crop" in job_results and not result.get("sex"):
+        raw = _strip_label(job_results["sex_crop"], "sex")
         if raw:
             debug["sex_crop"] = raw[:80]
         if "FEMALE" in raw or re.search(r"\bF\b", raw):
@@ -881,8 +917,8 @@ async def read_passport_fields(
         if result["sex"]:
             src["sex"] = "app_crop"
 
-    if data.get("nationality_crop") and not result.get("nationality"):
-        raw = _strip_label(_ocr_crop(data["nationality_crop"], "nationality"), "nationality")
+    if "nationality_crop" in job_results and not result.get("nationality"):
+        raw = _strip_label(job_results["nationality_crop"], "nationality")
         raw = re.sub(r"[^A-Z ]", " ", raw)
         raw = re.sub(r"\s+", " ", raw).strip()
         if raw:
