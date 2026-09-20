@@ -13,11 +13,10 @@ import tempfile
 from pathlib import Path
 from datetime import date
 from typing import Optional
+from PIL import Image
 
 # Render has a small/burstable CPU. Tesseract/OpenMP trying to use several
 # threads is fast on a desktop but can get heavily throttled in the cloud.
-# Keep every OCR subprocess single-threaded so the first passport and the
-# fifth passport behave the same instead of timing out after the CPU burst.
 os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -31,7 +30,7 @@ from fastapi.responses import JSONResponse
 from mrz.checker.td3 import TD3CodeChecker
 
 app = FastAPI(title="Passport Reader API")
-SERVER_VERSION = "cloud-app-crop-v33"
+SERVER_VERSION = "cloud-app-crop-v34"
 logger = logging.getLogger(__name__)
 
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -95,30 +94,6 @@ def _resize_min_width(gray, width):
     return cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
 
-def _field_variants(gray, width=900):
-    """Return complementary variants without over-upscaling faint text."""
-    if gray is None:
-        return []
-
-    # Medium 2x image preserves the original stroke shapes. Some very faint
-    # Pakistani scans read worse when expanded straight to 900px.
-    medium = gray
-    if gray.shape[1] < 450:
-        medium = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    medium_strong = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8)).apply(medium)
-    _, medium_strong_otsu = cv2.threshold(
-        medium_strong, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    img = _resize_min_width(gray, width)
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(img)
-    strong = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8)).apply(img)
-    blur = cv2.GaussianBlur(clahe, (0, 0), 0.7)
-    sharp = cv2.addWeighted(clahe, 1.40, blur, -0.40, 0)
-    _, otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, strong_otsu = cv2.threshold(strong, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return [img, sharp, otsu, strong_otsu, medium_strong_otsu]
-
 def _ocr(img, whitelist, psm=7, timeout=10):
     if img is None:
         return ""
@@ -131,9 +106,6 @@ def _ocr(img, whitelist, psm=7, timeout=10):
         text = pytesseract.image_to_string(img, config=cfg, lang="eng", timeout=timeout)
         return re.sub(r"\s+", " ", text).strip().upper()
     except RuntimeError as exc:
-        # pytesseract raises RuntimeError when its per-call timeout expires.
-        # Log the actual reason; the previous code only printed the exception
-        # type, which hid the real Render slowdown.
         logger.warning("Field OCR RuntimeError: %s", exc)
         return ""
     except Exception as exc:
@@ -183,7 +155,6 @@ def _plausible_name(name):
     letters = name.replace(" ", "")
     if len(set(letters)) <= 1:
         return False
-    # Reject the exact MRZ filler pattern seen in the bad reads: K K K / KKKK...
     if sum(1 for ch in letters if ch == "K") / max(1, len(letters)) > 0.65:
         return False
     return True
@@ -200,9 +171,6 @@ def _name_has_mrz_noise(name):
     for w in words:
         if len(w) == 1:
             return True
-        # OCR frequently turns MRZ filler '<' into K/X/S and sometimes one
-        # stray E/C. Catch tails like KKKKKSKSEKK instead of accepting them
-        # as a real second name.
         if len(w) >= 4:
             filler_ratio = sum(ch in "KXS" for ch in w) / len(w)
             if filler_ratio >= 0.55:
@@ -213,83 +181,15 @@ def _name_has_mrz_noise(name):
 
 
 def _strip_name_noise_tokens(name):
-    """Drop tiny OCR remnants of printed labels without changing real name words."""
     n = _clean_name(name)
     if not n:
         return ""
     words = n.split()
-    # Common remnants from labels: GIVEN NAME -> G N, FATHER NAME -> F N,
-    # PASSPORT -> P.  Remove only isolated one-letter tokens.
     words = [w for w in words if not (len(w) == 1 and w in {"G", "N", "F", "P"})]
     return " ".join(words).strip()
 
 
-def _name_candidate_score(raw, kind):
-    stripped = _strip_label(raw, kind)
-    clean = _strip_name_noise_tokens(stripped)
-    if not _plausible_name(clean):
-        return (-999, clean)
-    words = clean.split()
-    score = 20 + min(len(clean), 30)
-    if len(words) <= 4:
-        score += 5
-    if any(re.fullmatch(r"[KXS]{2,}", w) for w in words):
-        score -= 20
-    if sum(ch == "K" for ch in clean.replace(" ", "")) > 4:
-        score -= 12
-    return (score, clean)
-
-
-def _choose_ocr_name_candidate(reads, kind):
-    candidates = []
-    for raw in reads:
-        if not raw:
-            continue
-        score, clean = _name_candidate_score(raw, kind)
-        if score <= -999 or not clean:
-            continue
-        candidates.append((clean, score))
-    if not candidates:
-        return ""
-
-    # Exact agreement between independent OCR passes is the strongest signal.
-    counts = {}
-    best_score = {}
-    for clean, score in candidates:
-        counts[clean] = counts.get(clean, 0) + 1
-        best_score[clean] = max(best_score.get(clean, -999), score)
-    repeated = [name for name, count in counts.items() if count >= 2]
-    if repeated:
-        return max(repeated, key=lambda name: (counts[name], best_score[name], len(name)))
-
-    # Otherwise prefer the candidate closest to the others, not simply the
-    # longest string (which often contains label noise).
-    unique = list(counts)
-    def rank(name):
-        distance = sum(_edit(name, other) for other in unique if other != name)
-        return (-distance, best_score[name], len(name))
-    return max(unique, key=rank)
-
-
-def _edit(a, b):
-    if a == b:
-        return 0
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        cur = [i]
-        for j, cb in enumerate(b, 1):
-            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
-        prev = cur
-    return prev[-1]
-
-
 def _choose_name(mrz_name, printed_name, mrz_verified=False):
-    """Use printed crop only for unmistakable MRZ filler corrections.
-
-    A clean MRZ name must NOT be replaced by a one-character OCR mistake such
-    as SOOMRO -> SGOMRO. Printed OCR is allowed to fix only the known filler
-    patterns caused by '<' becoming K/X/S.
-    """
     m = _clean_name(mrz_name)
     p = _clean_name(printed_name)
 
@@ -311,7 +211,6 @@ def _choose_name(mrz_name, printed_name, mrz_verified=False):
         mw.pop()
     m_trim = " ".join(mw)
 
-    # Whole filler tail removed.
     if p == m_trim:
         return p
 
@@ -325,13 +224,10 @@ def _choose_name(mrz_name, printed_name, mrz_verified=False):
         if a == b:
             continue
 
-        # TASSAWARK -> TASSAWAR
         if len(a) == len(b) + 1 and a[-1] in "KXS" and a[:-1] == b:
             changed = True
             continue
 
-        # JAWAD KALI -> JAWAD ALI; never do this to the first word so
-        # KASHAF can never become ASHAF.
         if (
             idx > 0
             and len(a) == len(b) + 1
@@ -341,7 +237,6 @@ def _choose_name(mrz_name, printed_name, mrz_verified=False):
             changed = True
             continue
 
-        # Any ordinary OCR substitution (SOOMRO -> SGOMRO etc.) is rejected.
         return m_trim if m_trim != m else m
 
     return p if changed else (m_trim if m_trim != m else m)
@@ -392,43 +287,14 @@ def _format_mrz_date(v, birth):
         return ""
 
 
-def _value_band(gray, kind):
-    """Keep the vertical band where the requested value lives inside app crop."""
-    if gray is None or gray.size == 0:
-        return gray
-    h = gray.shape[0]
-    ranges = {
-        "given": (0.00, 0.62),
-        "surname": (0.00, 0.62),
-        "father": (0.00, 0.72),
-        "passport": (0.00, 0.68),
-        "nationality": (0.00, 0.68),
-        "sex": (0.00, 0.68),
-    }
-    if kind not in ranges:
-        return gray
-    y0, y1 = ranges[kind]
-    a = max(0, int(h * y0))
-    b = min(h, max(a + 4, int(h * y1)))
-    return gray[a:b, :]
-
-
-def _quick_variant(gray, width=900, clahe=False, otsu=False):
+def _quick_variant(gray, width=900, clahe=False):
     img = _resize_min_width(gray, width)
     if clahe:
         img = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8)).apply(img)
-    if otsu:
-        _, img = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return img
 
 
 def _ocr_crop(data: bytes, kind: str):
-    """Read one label+value crop.
-
-    v23 receives the small field block itself (printed label + printed value),
-    so do not cut a fixed percentage from the crop. Let Tesseract see both;
-    downstream parsers remove the label and keep the requested value.
-    """
     gray = _decode(data)
     if gray is None:
         return ""
@@ -456,22 +322,11 @@ def _ocr_crop(data: bytes, kind: str):
     return ""
 
 
-
 def _batch_prepare_crop(data: bytes, kind: str, target_h: int = 170):
-    """Prepare one crop while preserving the printed strokes.
-
-    The previous stacked-batch path applied CLAHE to every name crop and then
-    squeezed all fields into one large page. On pale Pakistani passports that
-    destroyed thin letters (IJAZ -> ATA, FAIZ MUHAMMAD -> random fragments).
-    Keep each crop as its own Tesseract page instead.
-    """
     gray = _decode(data)
     if gray is None or gray.size == 0:
         return None
 
-    # Keep the original grayscale for names/dates/passport. It tested better on
-    # the faint green passport stock. Use only a very mild contrast lift for
-    # nationality/sex, where the value is short and often low contrast.
     if kind in {"nationality", "sex"}:
         gray = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8)).apply(gray)
 
@@ -483,13 +338,10 @@ def _batch_prepare_crop(data: bytes, kind: str, target_h: int = 170):
     new_w = max(120, min(1800, int(w * scale)))
     resized = cv2.resize(gray, (new_w, target_h), interpolation=cv2.INTER_CUBIC)
 
-    # Mild sharpening helps thin printed letters without the halo/noise CLAHE
-    # created in the old implementation.
     if kind in {"given", "surname", "father", "passport"}:
         blur = cv2.GaussianBlur(resized, (0, 0), 0.55)
         resized = cv2.addWeighted(resized, 1.22, blur, -0.22, 0)
 
-    # White border prevents edge characters from being clipped by Tesseract.
     return cv2.copyMakeBorder(
         resized, 12, 12, 18, 18,
         cv2.BORDER_CONSTANT,
@@ -497,14 +349,18 @@ def _batch_prepare_crop(data: bytes, kind: str, target_h: int = 170):
     )
 
 
-def _batch_ocr_printed(data: dict):
-    """Read all printed crops with ONE Tesseract process, one page per crop.
+def _ocr_crop_fallback(im, kind):
+    if im is None or im.size == 0:
+        return ""
+    cfg = "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+    try:
+        text = pytesseract.image_to_string(im, config=cfg, lang="eng", timeout=8)
+        return re.sub(r"\s+", " ", text).strip().upper()
+    except Exception:
+        return ""
 
-    Tesseract accepts a .txt list of image paths as a multi-page input. This
-    keeps each crop independently segmented (unlike the old stacked canvas)
-    while still spawning only one OCR process, so Render remains stable after
-    repeated passports.
-    """
+
+def _batch_ocr_printed(data: dict):
     specs = [
         ("given_name_crop", "given"),
         ("surname_crop", "surname"),
@@ -525,9 +381,6 @@ def _batch_ocr_printed(data: dict):
         if im is not None and im.size:
             prepared.append((field, kind, im))
 
-            # Father/Husband name and Issue Date are the two fields MRZ cannot
-            # recover. Add a second image variant as another page in the SAME
-            # Tesseract process (no extra subprocess / no Render instability).
             if kind == "father":
                 alt = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8)).apply(im)
                 prepared.append((field, kind, alt))
@@ -544,42 +397,52 @@ def _batch_ocr_printed(data: dict):
         '-c tessedit_char_whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789,.\'/- "'
     )
 
+    ocr = None
+    page_to_field = {}
+
     try:
         with tempfile.TemporaryDirectory(prefix="passport_ocr_") as tmp:
             tmp_path = Path(tmp)
-            image_paths = []
-            page_to_field = {}
+            pil_images = []
 
             for page_num, (field, kind, im) in enumerate(prepared, start=1):
-                image_path = tmp_path / f"{page_num:02d}_{kind}.png"
-                if not cv2.imwrite(str(image_path), im):
-                    continue
-                image_paths.append(str(image_path))
-                page_to_field[len(image_paths)] = field
+                pil_images.append(Image.fromarray(im))
+                page_to_field[page_num] = field
 
-            if not image_paths:
+            if not pil_images:
                 return {}, ""
 
-            list_path = tmp_path / "input_list.txt"
-            list_path.write_text("\n".join(image_paths), encoding="utf-8")
+            tif_path = tmp_path / "multipage.tif"
+            pil_images[0].save(
+                str(tif_path),
+                save_all=True,
+                append_images=pil_images[1:],
+                format="TIFF",
+            )
 
             ocr = pytesseract.image_to_data(
-                str(list_path),
+                str(tif_path),
                 config=cfg,
                 lang="eng",
                 output_type=pytesseract.Output.DICT,
                 timeout=26,
             )
-    except RuntimeError as exc:
-        logger.warning("Printed multipage OCR RuntimeError: %s", exc)
-        return {}, ""
     except Exception as exc:
         logger.warning("Printed multipage OCR failed (%s): %s", type(exc).__name__, exc)
-        return {}, ""
+        ocr = None
 
-    # Preserve Tesseract line boundaries. Father/husband crops often also
-    # contain a small piece of the next label; picking the strongest text line
-    # avoids turning "FAIZ MUHAMMAD" into random words from "Date of Issue".
+    # Fallback to individual crop OCR if multi-page batch OCR returned no results
+    if not ocr or not ocr.get("text"):
+        raw = {}
+        for field, kind, im in prepared:
+            if field in raw and raw[field]:
+                continue
+            txt = _ocr_crop_fallback(im, kind)
+            if txt:
+                raw[field] = txt
+        debug_text = " | ".join(f"{k}={v}" for k, v in raw.items() if v)
+        return raw, debug_text[:1200]
+
     lines_by_field = {field: {} for field, _, _ in prepared}
     for i, token in enumerate(ocr.get("text", [])):
         token = (token or "").strip()
@@ -634,25 +497,21 @@ def _batch_ocr_printed(data: dict):
                 return avg_conf + alpha_len * 3.5 + comma_bonus + count_bonus - label_penalty - noise_penalty
             raw[field] = max(line_rows, key=father_line_score)[0]
         else:
-            # Keep all lines for dates/given/surname; downstream parsers use MRZ
-            # hints and date patterns to pick the requested value.
             raw[field] = " ".join(row[0] for row in line_rows)
 
     debug_text = " | ".join(f"{k}={v}" for k, v in raw.items() if v)
     return raw, debug_text[:1200]
+
 
 def _words_only(text):
     return re.findall(r"[A-Z]{2,}", (text or "").upper())
 
 
 def _best_printed_name(raw, kind, mrz_hint=""):
-    """Extract a name from one batch-OCR band, using MRZ only as a hint."""
     s = re.sub(r"\s+", " ", (raw or "").upper()).strip()
     if not s:
         return ""
 
-    # Father/Husband often appears as SURNAME, GIVEN on Pakistani passports.
-    # A comma pair is a very strong signal and _clean_name reverses it.
     if kind == "father":
         comma = re.search(
             r"\b([A-Z]{2,}(?:[- ]+[A-Z]{2,}){0,2})\s*,\s*"
@@ -664,9 +523,6 @@ def _best_printed_name(raw, kind, mrz_hint=""):
             right_words = _words_only(comma.group(2))
             kept = []
             for w in right_words:
-                # Stop at obvious OCR crumbs such as OO / TR that often come
-                # from the next printed label. Real Pakistani name words here
-                # are normally at least three letters.
                 if len(w) < 3:
                     break
                 kept.append(w)
@@ -677,7 +533,6 @@ def _best_printed_name(raw, kind, mrz_hint=""):
                 if _plausible_name(candidate):
                     return candidate
 
-        # Capture words after Father/Husband Name, tolerating OCR's NAME typo.
         m = re.search(
             r"(?:FATHER|HUSBAND|GUARDIAN)\s+[A-Z]{2,8}\s+(.+)", s
         )
@@ -691,7 +546,6 @@ def _best_printed_name(raw, kind, mrz_hint=""):
             if _plausible_name(candidate):
                 return candidate
 
-    # If a printed label survived OCR, text after it is normally the value.
     label_patterns = {
         "given": r"\b(?:GIVEN|GIVFN|GIVEM)\s+[A-Z]{2,8}\b",
         "surname": r"\b(?:SURNAME|SURNAMF|SUR[A-Z]{3,8})\b",
@@ -707,8 +561,6 @@ def _best_printed_name(raw, kind, mrz_hint=""):
                 return candidate
 
     if kind == "father":
-        # In a tight father/husband crop the actual value is normally the first
-        # 2-4 meaningful words. Stop when the next printed field label begins.
         tail = re.split(
             r"\b(?:DATE|ISSUE|EXPIRY|NATIONALITY|ISSUING|AUTHORITY|PASSPORT|SEX|PLACE)\b",
             s,
@@ -716,7 +568,6 @@ def _best_printed_name(raw, kind, mrz_hint=""):
         )[0]
         fw = [w for w in _words_only(tail) if w not in LABEL_WORDS and len(w) >= 2]
         if fw:
-            # Prefer up to 4 leading words, but drop obvious OCR crumbs at the end.
             kept = []
             for w in fw:
                 if len(kept) >= 2 and len(w) <= 2:
@@ -724,13 +575,9 @@ def _best_printed_name(raw, kind, mrz_hint=""):
                 kept.append(w)
                 if len(kept) >= 4:
                     break
-            # Try longest-to-shortest so MUHAMMAD HASSAN SHAH remains intact,
-            # while FAIZ MUHAMMAD + trailing noise can fall back to two words.
             for n in range(min(4, len(kept)), 1, -1):
                 candidate = _clean_name(" ".join(kept[:n]))
                 if _plausible_name(candidate):
-                    # If the last word looks like a short OCR fragment, retry
-                    # without it before accepting.
                     if n > 2 and len(kept[n - 1]) <= 3:
                         shorter = _clean_name(" ".join(kept[:n - 1]))
                         if _plausible_name(shorter):
@@ -741,8 +588,6 @@ def _best_printed_name(raw, kind, mrz_hint=""):
     if not words:
         return ""
 
-    # With an MRZ hint, choose the 1-4 word sequence closest to it. This turns
-    # raw 'ABBAS ... TASSAWAR' + hint TASSAWARK into printed TASSAWAR.
     hint = _clean_name(mrz_hint)
     candidates = []
     for size in range(1, min(4, len(words)) + 1):
@@ -780,10 +625,19 @@ def _best_printed_name(raw, kind, mrz_hint=""):
                         v = _clean_name(" ".join(trimmed))
                         if _plausible_name(v):
                             expanded.add(v)
-        return min(expanded, key=lambda c: (_edit(c, hint), abs(len(c) - len(hint)), len(c)))
 
-    # Without an MRZ hint, prefer a compact plausible value rather than all
-    # surrounding label/context words.
+        def edit_dist(a, b):
+            if a == b: return 0
+            p = list(range(len(b) + 1))
+            for i, ca in enumerate(a, 1):
+                c = [i]
+                for j, cb in enumerate(b, 1):
+                    c.append(min(p[j] + 1, c[j - 1] + 1, p[j - 1] + (ca != cb)))
+                p = c
+            return p[-1]
+
+        return min(expanded, key=lambda c: (edit_dist(c, hint), abs(len(c) - len(hint)), len(c)))
+
     return max(candidates, key=lambda c: (min(len(c.split()), 3), len(c)))
 
 
@@ -822,7 +676,7 @@ def _parse_printed_batch(raw_map, mrz=None):
         debug["passport_number_crop"] = raw[:180]
         up = re.sub(r"\b(?:PASSPORT|DOCUMENT|NUMBER|NO)\b", " ", raw.upper())
         tokens = re.findall(r"[A-Z0-9]{6,12}", re.sub(r"[^A-Z0-9]", " ", up))
-        tokens = [t for t in tokens if any(ch.isdigit() for ch in t)]
+        tokens = [t for t in tokens if t not in LABEL_WORDS and any(ch.isdigit() for ch in t)]
         if tokens:
             out["passport_number"] = min(tokens, key=lambda x: abs(len(x) - 9))
 
@@ -850,6 +704,7 @@ def _parse_printed_batch(raw_map, mrz=None):
             out["sex"] = "M"
 
     return out, debug
+
 
 def _clean_mrz_line(line):
     s = (line or "").upper()
@@ -888,24 +743,13 @@ def _looks_like_td3(l1, l2):
 
 
 def _digits_only_ocr(text):
-    """Normalize common OCR confusions only where a numeric MRZ field is expected."""
     table = str.maketrans({"O":"0", "Q":"0", "D":"0", "I":"1", "L":"1", "Z":"2", "S":"5", "B":"8", "G":"6"})
     return (text or "").translate(table)
 
 
 def _mrz_name_block(block):
-    """Decode an MRZ name block without letting filler OCR become a name.
-
-    Pakistani MRZ fillers '<' are often read as K/X/S/C/B/O.  The old parser
-    only stopped K/X/S, which allowed values such as SHAGUFTABOCSSCCCCCC.
-    """
     raw = (block or "").upper()
-
-    # If OCR changed a long run of fillers into letters, cut that suspicious
-    # suffix before tokenizing.  Require at least 4 filler-like chars so real
-    # names such as ABBAS / BUKHARI are not touched.
     raw = re.sub(r"(?<=[A-Z])[KXSCBO]{4,}$", "", raw)
-
     parts = [p for p in re.split(r"<+", raw) if p]
     words = []
 
@@ -914,8 +758,6 @@ def _mrz_name_block(block):
         if not t:
             continue
 
-        # Cut a filler-like suffix stuck onto a real word:
-        # SHAGUFTA + BOCSSCCCC -> SHAGUFTA.
         m = re.match(r"^([A-Z]{2,}?)([KXSCBO]{4,})$", t)
         if m:
             prefix = m.group(1)
@@ -939,14 +781,11 @@ def _mrz_name_block(block):
 
 
 def _parse_mrz_fuzzy(l1, l2):
-    """Best-effort TD3 parser when one OCR error makes TD3CodeChecker reject the pair."""
     a = _clean_mrz_line(l1)
     b = _clean_mrz_line(l2)
     if len(a) < 20 or not a.startswith("P"):
         return None
 
-    # Find country code from the first line. Pakistan is the common case, but
-    # keep the parser generic for known three-letter codes.
     country = ""
     country_pos = -1
     for code in COUNTRY_NAMES:
@@ -964,7 +803,6 @@ def _parse_mrz_fuzzy(l1, l2):
 
     name_start = country_pos + 3
     name_body = a[name_start:]
-    # OCR may produce <<< instead of <<. One or more extra fillers are harmless.
     parts = re.split(r"<{2,}", name_body, maxsplit=1)
     if len(parts) < 2:
         return None
@@ -975,30 +813,26 @@ def _parse_mrz_fuzzy(l1, l2):
     if not _plausible_name(giv):
         giv = ""
 
-    # Second line: locate nationality code instead of trusting exact columns.
     nat_pos = -1
     nat = ""
     for code in NATIONALITY_NAMES:
-        idx = b.find(code)
-        if 7 <= idx <= 14:
+        idx = b.find(code, 7, 15)
+        if idx >= 0:
             nat, nat_pos = code, idx
             break
     if nat_pos < 0:
-        # Country code is usually also the nationality code.
-        idx = b.find(country)
-        if 7 <= idx <= 14:
+        idx = b.find(country, 7, 15)
+        if idx >= 0:
             nat, nat_pos = country, idx
     if nat_pos < 0:
         return None
 
     prefix = b[:nat_pos]
-    # Standard TD3 = 9-char document number + one check digit before nationality.
     number = re.sub(r"<", "", prefix[:9]).upper()
     if len(number) < 6:
         return None
 
     tail = b[nat_pos + 3:]
-    # Birth date is the first six-character numeric-like block after nationality.
     m_birth = re.search(r"[0-9OQDILZSBG]{6}", tail)
     if not m_birth:
         return None
@@ -1013,7 +847,6 @@ def _parse_mrz_fuzzy(l1, l2):
             sex_index = i
             break
     if sex_index < 0:
-        # If check digit was swallowed, sex may immediately follow the date.
         sex_index = 0
     after_sex = after_birth[sex_index + 1:]
     m_exp = re.search(r"[0-9OQDILZSBG]{6}", after_sex)
@@ -1051,7 +884,6 @@ def _prefer_mrz_candidate(current, candidate):
     if candidate is None:
         return current
 
-    # Prefer the shorter name when the only extra tail is likely filler K/X/S.
     for key in ("given_name_en", "surname_en"):
         a = _clean_name(current.get(key, ""))
         b = _clean_name(candidate.get(key, ""))
@@ -1113,12 +945,6 @@ def _try_mrz(l1, l2):
 
 
 def _mrz_from_bytes(data: bytes):
-    """Read MRZ once, with a realistic timeout for Render's slower CPU.
-
-    The previous 6-second timeout was the direct source of repeated
-    `MRZ OCR failed (RuntimeError)` messages. Two timed-out passes alone cost
-    about 12 seconds and then all field OCR started from scratch.
-    """
     gray = _decode(data)
     if gray is None:
         return None, ""
@@ -1151,31 +977,15 @@ def _mrz_from_bytes(data: bytes):
 
 
 def _choose_passport_number(mrz_number, printed_number, country="", mrz_verified=False):
-    """Reconcile passport number conservatively.
-
-    For Pakistan the expected layout is two letters + seven digits. OCR often
-    confuses G/6 and Z/2 in the two-letter prefix. Normalize by position before
-    comparing, instead of blindly trusting either source.
-    """
     m = re.sub(r"[^A-Z0-9]", "", (mrz_number or "").upper())
     p = re.sub(r"[^A-Z0-9]", "", (printed_number or "").upper())
-
     country_up = (country or "").upper()
 
     def normalize_pak(v):
         if len(v) != 9:
             return v
-
-        prefix_map = {
-            "0": "O", "1": "I", "2": "Z", "5": "S",
-            "6": "G", "8": "B",
-        }
-        digit_map = {
-            "O": "0", "Q": "0", "D": "0",
-            "I": "1", "L": "1", "Z": "2",
-            "S": "5", "G": "6", "B": "8",
-        }
-
+        prefix_map = {"0": "O", "1": "I", "2": "Z", "5": "S", "6": "G", "8": "B"}
+        digit_map = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "G": "6", "B": "8"}
         first = "".join(prefix_map.get(ch, ch) for ch in v[:2])
         rest = "".join(digit_map.get(ch, ch) for ch in v[2:])
         return first + rest
@@ -1194,14 +1004,29 @@ def _choose_passport_number(mrz_number, printed_number, country="", mrz_verified
         if m_ok and not p_ok:
             return m
         if p_ok and m_ok:
-            # If both normalize to valid Pakistani numbers, agreement/near
-            # agreement is enough; otherwise keep MRZ rather than inventing.
             if p == m:
                 return m
-            return p if _edit(p, m) <= 2 and not mrz_verified else m
+            def edit_dist(a, b):
+                p_arr = list(range(len(b) + 1))
+                for i, ca in enumerate(a, 1):
+                    c = [i]
+                    for j, cb in enumerate(b, 1):
+                        c.append(min(p_arr[j] + 1, c[j - 1] + 1, p_arr[j - 1] + (ca != cb)))
+                    p_arr = c
+                return p_arr[-1]
+            return p if edit_dist(p, m) <= 2 and not mrz_verified else m
 
     if p and m:
-        if len(p) == len(m) and _edit(p, m) <= 1:
+        def edit_dist(a, b):
+            p_arr = list(range(len(b) + 1))
+            for i, ca in enumerate(a, 1):
+                c = [i]
+                for j, cb in enumerate(b, 1):
+                    c.append(min(p_arr[j] + 1, c[j - 1] + 1, p_arr[j - 1] + (ca != cb)))
+                p_arr = c
+            return p_arr[-1]
+
+        if len(p) == len(m) and edit_dist(p, m) <= 1:
             return p if not mrz_verified else m
 
         def score(v):
@@ -1301,13 +1126,10 @@ async def read_passport_fields(
     src = result["field_sources"]
     debug = {}
 
-    # 1) ONE OCR process for every printed crop. This includes the two fields
-    #    MRZ can never supply: father/husband name + issue date.
     batch_raw, batch_debug = _batch_ocr_printed(data)
     if batch_debug:
         debug["printed_batch"] = batch_debug
 
-    # 2) ONE MRZ process for structural fields and name hints.
     mrz = None
     if data.get("mrz_crop"):
         mrz, mrz_raw = _mrz_from_bytes(data["mrz_crop"])
@@ -1329,9 +1151,6 @@ async def read_passport_fields(
     printed, printed_debug = _parse_printed_batch(batch_raw, mrz)
     debug.update(printed_debug)
 
-    # Father/Husband + Issue Date are not in MRZ. If the single batch OCR
-    # missed either one, retry ONLY those crops. This is at most two small OCR
-    # calls, not ten calls, so it does not recreate the old Render collapse.
     if not printed.get("father_name_en") and data.get("father_name_crop"):
         father_retry_raw = _ocr_crop(data["father_name_crop"], "father")
         if father_retry_raw:
@@ -1348,9 +1167,6 @@ async def read_passport_fields(
             if issue_dates:
                 printed["issue_date"] = _date_text(issue_dates[0])
 
-    # Printed names can correct only explicit MRZ filler noise.
-    # If MRZ was read and the surname zone is explicitly blank (for example
-    # P<PAK<<FOZIA...), do NOT invent a surname from OCR noise.
     for key in ("given_name_en", "surname_en"):
         p = printed.get(key, "")
         if not p:
@@ -1360,16 +1176,15 @@ async def read_passport_fields(
             debug["surname_printed_ignored_mrz_blank"] = p
             continue
 
-        result[key] = _choose_name(
+        chosen = _choose_name(
             result.get(key, ""),
             p,
             bool(result.get("is_verified")),
         )
-        src[key] = "printed_batch"
+        if chosen != result.get(key, "") or not result.get(key):
+            result[key] = chosen
+            src[key] = "printed_batch"
 
-    # Father/Husband and Issue Date exist only in printed fields.
-    # Never accept the holder's own GIVEN/SURNAME as Father; that was the
-    # exact MURTAZA -> GHULAM failure caused by a wrong crop.
     father_candidate = _clean_name(printed.get("father_name_en", ""))
     if father_candidate:
         father_raw = (batch_raw.get("father_name_crop", "") or "").upper()
@@ -1392,8 +1207,6 @@ async def read_passport_fields(
 
     issue_candidate = printed.get("issue_date")
     if issue_candidate:
-        # Issue date cannot equal DOB or expiry. Reject a crop that accidentally
-        # landed on one of those rows instead of writing a wrong date.
         if issue_candidate in {
             result.get("birth_date"),
             result.get("expiry_date"),
@@ -1403,9 +1216,6 @@ async def read_passport_fields(
             result["issue_date"] = issue_candidate
             src["issue_date"] = "printed_batch"
 
-    # Reconcile the focused printed number with MRZ. On Pakistani passports
-    # this prevents both GZ... -> 6Z... and the opposite failure where the crop
-    # loses the first two letters entirely.
     chosen_number = _choose_passport_number(
         result.get("passport_number", ""),
         printed.get("passport_number", ""),
@@ -1417,9 +1227,6 @@ async def read_passport_fields(
             src["passport_number"] = "printed_batch"
         result["passport_number"] = chosen_number
 
-    # For the remaining structural fields keep MRZ when available; use printed
-    # values as fallback. Issue date was already handled above because MRZ does
-    # not contain it.
     for key in ("birth_date", "expiry_date", "nationality", "sex"):
         if not result.get(key) and printed.get(key):
             result[key] = printed[key]
@@ -1439,7 +1246,7 @@ async def read_passport_fields(
         return JSONResponse(status_code=422, content={
             "success": False,
             "error": "وصلت القصاصات لكن OCR ما استخرج بيانات مفيدة",
-            "mode": "pak_row_model_10_v33",
+            "mode": "pak_row_model_10_v34",
             "server_version": SERVER_VERSION,
             "ocr_time_ms": elapsed_ms,
             "crop_debug": debug,
@@ -1447,8 +1254,8 @@ async def read_passport_fields(
 
     result.update({
         "success": True,
-        "mode": "pak_row_model_10_v33",
-        "client_crop_mode": client_crop_mode or "pak_row_model_10_v33",
+        "mode": "pak_row_model_10_v34",
+        "client_crop_mode": client_crop_mode or "pak_row_model_10_v34",
         "server_version": SERVER_VERSION,
         "ocr_time_ms": elapsed_ms,
         "received_crops": sorted(data.keys()),
@@ -1492,7 +1299,6 @@ async def read_passport(file: UploadFile = File(...)):
     best = None
     for image_variant in (color, cv2.rotate(color, cv2.ROTATE_180)):
         hh, ww = image_variant.shape[:2]
-        # MRZ is normally in the lower 45%; no need to OCR the full passport.
         crop = image_variant[int(hh * 0.55):hh, 0:ww]
         ok, enc = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 94])
         if not ok:
